@@ -111,3 +111,4 @@ export class LichessApiAdapter implements ChessEngine {
     }
   }
 }
+

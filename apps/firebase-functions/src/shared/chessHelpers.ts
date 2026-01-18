@@ -83,3 +83,4 @@ function toMoveDTO(move: Move): MoveDTO {
   };
   return promotion ? { ...base, promotion } : base;
 }
+

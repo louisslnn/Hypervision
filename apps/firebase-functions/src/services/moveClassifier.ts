@@ -146,3 +146,4 @@ export type MoveAnalysis = {
   cpl: number;
   classification: MoveClassification;
 };
+

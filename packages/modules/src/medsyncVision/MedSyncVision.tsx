@@ -169,37 +169,40 @@ interface DrawingStroke {
   velocityY?: number;
 }
 
-// Configuration - Optimized for surgical tool tracking
+// Configuration - Balanced for 15-16+ FPS with AI-assisted accuracy
 const CONFIG = {
-  // Balanced optical flow - improved for multi-marker accuracy
-  SEARCH_RADIUS: 58, // Slightly increased from 55
-  SAMPLE_RADIUS: 20, // Increased from 18 for better context
-  SAMPLE_STEP: 2,    // Keep at 2 for accuracy
-  MIN_FLOW_CONFIDENCE: 0.20, // Slightly lower for faster motion
-  FORWARD_BACKWARD_THRESHOLD: 6.5, // Slightly more tolerant
+  // Optical flow - optimized for speed, AI compensates for accuracy
+  SEARCH_RADIUS: 45,   // Reduced for FPS (AI handles re-acquisition)
+  SAMPLE_RADIUS: 16,   // Smaller context, faster processing
+  SAMPLE_STEP: 3,      // Larger step for speed
+  MIN_FLOW_CONFIDENCE: 0.20, // Balanced threshold
+  FORWARD_BACKWARD_THRESHOLD: 8.0, // Tolerant for fast motion
 
-  // Additional scales for multi-scale matching
-  MULTI_SCALE_FACTORS: [0.85, 1.0, 1.15],
+  // Multi-scale matching - minimal scales for speed
+  MULTI_SCALE_FACTORS: [0.9, 1.0, 1.1],
 
-  // State transitions - more tolerant for surgical scenarios
-  OCCLUSION_SCORE_THRESHOLD: 4500, // Slightly higher
-  LOST_SCORE_THRESHOLD: 13000,     // Slightly higher
-  OCCLUSION_TIMEOUT: 18,           // Slightly faster
-  LOST_TIMEOUT: 200,               // Faster recovery
+  // State transitions - quick to defer to AI
+  OCCLUSION_SCORE_THRESHOLD: 4000, // Trigger occlusion earlier
+  LOST_SCORE_THRESHOLD: 12000,     // Trigger lost earlier (AI will find it)
+  OCCLUSION_TIMEOUT: 15,           // Quick to ask AI for help
+  LOST_TIMEOUT: 150,               // AI handles recovery
   BOUNDARY_GUARD: 15,
 
-  // Kalman filter - tuned for smooth tool tracking
-  KALMAN_PROCESS_NOISE: 0.6, // More responsive for fast motion
-  KALMAN_MEASUREMENT_NOISE: 0.15,
-  SMOOTHING_FACTOR: 0.35, // Lower = more responsive tracking
+  // Kalman filter - smooth tracking
+  KALMAN_PROCESS_NOISE: 0.5,
+  KALMAN_MEASUREMENT_NOISE: 0.12,
+  SMOOTHING_FACTOR: 0.32,
 
-  // Visual DNA - larger sample for better tool identification
-  COLOR_SAMPLE_SIZE: 48,
-  COLOR_MATCH_THRESHOLD: 0.45, // More permissive for re-ID
+  // Visual DNA - moderate sample size
+  COLOR_SAMPLE_SIZE: 40,           // Smaller for speed
+  COLOR_MATCH_THRESHOLD: 0.42,     // Balanced threshold
 
-  // Edge tracking for metallic surfaces
-  EDGE_WEIGHT: 0.55, // How much to weight edge matching (slightly higher for tools)
-  GRADIENT_SAMPLE_RADIUS: 24,
+  // Edge tracking
+  EDGE_WEIGHT: 0.55,
+  GRADIENT_SAMPLE_RADIUS: 20,      // Smaller for speed
+
+  // Visibility threshold - hide tracker when confidence is below this
+  VISIBILITY_CONFIDENCE_THRESHOLD: 0.35, // Hide when confidence drops below 35%
 
   // Rendering
   TRAIL_LENGTH: 80,
@@ -209,64 +212,64 @@ const CONFIG = {
 };
 
 const TEMPLATE_CONFIG = {
-  SIZE: 25,
-  MIN_NCC: 0.5,
-  UPDATE_INTERVAL_MS: 350,
-  UPDATE_CONFIDENCE: 0.7,
+  SIZE: 22,              // Smaller for speed
+  MIN_NCC: 0.48,         // Moderate threshold
+  UPDATE_INTERVAL_MS: 400, // Less frequent updates
+  UPDATE_CONFIDENCE: 0.65,
   UPDATE_ALPHA: 0.25,
-  COARSE_STEP: 3,
-  REFINE_RADIUS: 8
+  COARSE_STEP: 4,        // Larger step for speed
+  REFINE_RADIUS: 6       // Smaller refinement
 };
 
 const GLOBAL_MOTION_CONFIG = {
-  GRID_X: 4,        // Balanced from 5/3
-  GRID_Y: 3,        // Restored from 2
-  PATCH_SIZE: 15,   // Restored from 13
-  SEARCH_RADIUS: 16, // Balanced from 18/14
-  STEP: 2,          // Restored from 3
+  GRID_X: 3,        // Fewer grid points for speed
+  GRID_Y: 3,        // Fewer grid points for speed
+  PATCH_SIZE: 14,   // Smaller patches for speed
+  SEARCH_RADIUS: 14, // Smaller search radius
+  STEP: 3,          // Larger step for speed
   MIN_CONFIDENCE: 0.35
 };
 
 const FUSION_CONFIG = {
-  MIN_CONFIDENCE: 0.3,
-  GATING_FACTOR: 1.0
+  MIN_CONFIDENCE: 0.30, // Moderate threshold
+  GATING_FACTOR: 1.0    // Standard gating
 };
 
 const SOURCE_WEIGHTS = {
-  flow: 1,
-  yolo: 0.9,
-  template: 0.95,
-  anchor: 1.05,
-  orb: 1.1
+  flow: 1.0,      // Primary optical flow
+  yolo: 1.1,      // High trust in YOLO (server-side AI)
+  template: 0.9,  // Lower trust (simpler matching)
+  anchor: 1.0,    // Standard anchor trust
+  orb: 1.05       // Slight ORB boost
 } as const;
 
 const ANCHOR_PRECISION_OVERRIDES: Partial<AnchorConfig> = {
-  MAX_ANCHORS: 10,          // Balanced from 12/8
-  MIN_ANCHORS: 4,           // Restored from 3
-  DETECTION_RADIUS: 110,    // Balanced from 120/100
-  EDGE_THRESHOLD: 24,
-  CORNER_THRESHOLD: 0.015,
-  MIN_ANCHOR_SPACING: 10,   // Restored from 12
-  ANCHOR_SEARCH_RADIUS: 35, // Balanced from 40/28
-  MIN_ANCHOR_CONFIDENCE: 0.35,
-  TEMPLATE_UPDATE_CONFIDENCE: 0.7,
-  TEMPLATE_UPDATE_ALPHA: 0.2
+  MAX_ANCHORS: 8,           // Fewer anchors for speed
+  MIN_ANCHORS: 3,           // Lower minimum
+  DETECTION_RADIUS: 80,     // Smaller detection area
+  EDGE_THRESHOLD: 28,       // Higher threshold for fewer edges
+  CORNER_THRESHOLD: 0.02,   // Higher for fewer corners
+  MIN_ANCHOR_SPACING: 12,   // Sparser anchors
+  ANCHOR_SEARCH_RADIUS: 25, // Smaller search radius
+  MIN_ANCHOR_CONFIDENCE: 0.40,
+  TEMPLATE_UPDATE_CONFIDENCE: 0.70,
+  TEMPLATE_UPDATE_ALPHA: 0.20
 };
 
 const PROCESSING_PRESETS = {
   balanced: {
-    MAX_WIDTH: 960,
-    MAX_HEIGHT: 540,
-    TARGET_FPS: 30
+    MAX_WIDTH: 854,    // Lower resolution for better FPS
+    MAX_HEIGHT: 480,
+    TARGET_FPS: 30     // Target 30 FPS processing
   },
   precision: {
-    MAX_WIDTH: 1920,
-    MAX_HEIGHT: 1080,
-    TARGET_FPS: 22
+    MAX_WIDTH: 1280,
+    MAX_HEIGHT: 720,
+    TARGET_FPS: 24
   }
 } as const;
 
-const REID_UPDATE_INTERVAL_MS = 1200;
+const REID_UPDATE_INTERVAL_MS = 1500; // Less frequent (AI handles re-identification)
 
 const COLORS = [
   "#10b981",
@@ -280,32 +283,32 @@ const COLORS = [
 ];
 const STYLE_NAMES: AnnotationStyle[] = ["minimal", "standard", "detailed", "gaming"];
 
-// AI Object-Aware Tracking Configuration - More aggressive for better re-acquisition
+// AI Object-Aware Tracking Configuration - HIGH FREQUENCY for accuracy
+// Strategy: Lighter tracking + frequent AI validation = good FPS + great accuracy
 const AI_CONFIG = {
   // Auto-identification on marker placement
   AUTO_IDENTIFY_ON_PLACEMENT: true,
 
-  // Validation triggers - more frequent for better accuracy
-  VALIDATION_CONFIDENCE_THRESHOLD: 0.4, // Validate when confidence drops below this
-  VALIDATION_COOLDOWN_MS: 1200, // Faster validation checks (was 2000)
+  // Validation triggers - VERY frequent validation to maintain accuracy
+  VALIDATION_CONFIDENCE_THRESHOLD: 0.55, // Validate proactively when confidence drops
+  VALIDATION_COOLDOWN_MS: 500, // Very fast validation checks (2x per second max)
   VALIDATION_ON_OCCLUSION: true, // Validate when tracker becomes occluded
   
-  // IMPORTANT: Periodic validation even with anchors
-  // Anchors can boost confidence but don't verify we're on the RIGHT object
-  PERIODIC_VALIDATION_MS: 3500, // Run AI validation every 3.5 seconds (was 5s)
-  VALIDATE_WITH_ANCHORS: true, // Still validate even when anchors provide good tracking
+  // IMPORTANT: Frequent periodic validation is key to accuracy with light tracking
+  PERIODIC_VALIDATION_MS: 1500, // Run AI validation every 1.5 seconds
+  VALIDATE_WITH_ANCHORS: true, // Always validate even when anchors are tracking well
 
-  // Re-acquisition settings - much more aggressive search
-  REACQUISITION_START_FRAME: 3, // Start AI search very early (was 6)
-  REACQUISITION_INTERVAL_FRAMES: 8, // Much more frequent search (was 15)
-  REACQUISITION_MIN_CONFIDENCE: 0.38, // Accept lower confidence for faster recovery (was 0.45)
+  // Re-acquisition settings - AGGRESSIVE for instant recovery
+  REACQUISITION_START_FRAME: 1, // Start AI search immediately when lost
+  REACQUISITION_INTERVAL_FRAMES: 3, // Very frequent search (every 3 frames when lost)
+  REACQUISITION_MIN_CONFIDENCE: 0.30, // Accept lower confidence for faster recovery
 
   // Crop sizes for AI analysis
-  IDENTIFICATION_CROP_SIZE: 300, // Larger crop for initial identification
-  VALIDATION_CROP_SIZE: 200, // Smaller crop for validation checks
+  IDENTIFICATION_CROP_SIZE: 280, // Moderate crop size (faster upload)
+  VALIDATION_CROP_SIZE: 180, // Smaller crop for faster validation
 
-  // API settings
-  MAX_CONCURRENT_AI_CALLS: 4 // Allow more concurrent calls (was 3)
+  // API settings - allow many concurrent calls for responsiveness
+  MAX_CONCURRENT_AI_CALLS: 8 // More concurrent calls since we rely on AI heavily
 };
 
 // OpenAI model selection with safe fallback
@@ -4558,24 +4561,33 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
         Math.round(CONFIG.COLOR_SAMPLE_SIZE * processingDims.scale.scalar)
       );
       
-      // Balanced ReID for main thread mode - maintain quality
+      // Lightweight ReID - AI handles re-identification
       const reidBase = preferMainThread
         ? {
             ...DEFAULT_REID_CONFIG,
-            cropSize: 120,       // Good quality crop
-            downsampleSize: 30,  // Reasonable downsample
-            gridSize: 8,         // Decent grid
-            matchThreshold: 0.68 // Balanced threshold
+            cropSize: 80,        // Small crop for speed
+            downsampleSize: 20,  // Low resolution
+            gridSize: 5,         // Fewer grid cells
+            matchThreshold: 0.70, // Higher threshold (AI validates)
+            maxCandidates: 5     // Fewer candidates
           }
         : isPrecisionQuality
         ? {
             ...DEFAULT_REID_CONFIG,
-            cropSize: 160,
-            downsampleSize: 40,
-            gridSize: 10,
-            matchThreshold: 0.72
+            cropSize: 120,
+            downsampleSize: 30,
+            gridSize: 8,
+            matchThreshold: 0.68,
+            maxCandidates: 8
           }
-        : DEFAULT_REID_CONFIG;
+        : {
+            ...DEFAULT_REID_CONFIG,
+            cropSize: 100,
+            downsampleSize: 25,
+            gridSize: 6,
+            matchThreshold: 0.70,
+            maxCandidates: 6
+          };
       reidConfigRef.current = {
         ...reidBase,
         cropSize: Math.max(60, Math.round(reidBase.cropSize * processingDims.scale.scalar))
@@ -5344,6 +5356,14 @@ function renderAnnotations(
     if (!stroke || stroke.points.length < 2) return;
     if (!stroke.visible && stroke !== currentDrawing) return;
 
+    // For independent drawings (not attached to tracker), hide if confidence is low
+    if (!stroke.trackerId && stroke !== currentDrawing) {
+      const drawingConfidence = stroke.confidence ?? 1.0;
+      if (drawingConfidence < CONFIG.VISIBILITY_CONFIDENCE_THRESHOLD) {
+        return; // Don't render low-confidence independent drawings
+      }
+    }
+
     // Check if drawing is out of frame - skip rendering if all points are outside
     const canvasWidth = ctx.canvas.width;
     const canvasHeight = ctx.canvas.height;
@@ -5416,7 +5436,12 @@ function renderAnnotations(
 
     if (outOfFrame) return; // Don't render out-of-frame trackers
 
-    // Determine visibility
+    // Hide tracker if confidence is below threshold - ensures only reliable tracking is shown
+    if (confidence < CONFIG.VISIBILITY_CONFIDENCE_THRESHOLD) {
+      return; // Don't render low-confidence trackers
+    }
+
+    // Determine visibility based on state
     let opacity = 1.0;
     if (state === "lost" || state === "searching") {
       opacity = 0; // Hidden

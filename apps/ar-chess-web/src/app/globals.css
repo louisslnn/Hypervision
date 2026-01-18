@@ -552,6 +552,29 @@ section {
     box-shadow 0.15s;
 }
 
+.path-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(16, 16, 16, 0.1);
+  color: var(--color-slate);
+  box-shadow: 0 10px 24px rgba(16, 16, 16, 0.08);
+}
+
+.path-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .path-card:hover {
   transform: translateY(-4px);
   box-shadow: 0 16px 40px rgba(16, 16, 16, 0.12);
