@@ -31,6 +31,11 @@ Real-time security monitoring with advanced object detection and tracking. Ideal
 - Zone-based monitoring
 - Real-time detection pipeline
 
+**Demo & Collaboration:**
+- Switch between Camera, Demo clips, Upload, and WebRTC inside the SecureWatch UI
+- Optional WebRTC signaling server: `pnpm --filter @hypervision/securewatch-signaling dev`
+- Set `NEXT_PUBLIC_SECUREWATCH_SIGNAL_URL` to override the default signaling URL
+
 ### 🎮 **Entertainment** - AR Chess Experience
 Immersive augmented reality chess with hand gesture recognition and voice coaching.
 
@@ -106,9 +111,6 @@ Hypervision/
 │   ├── chess-domain/          # Chess logic
 │   ├── engine/                # Chess engine adapters
 │   └── ui-kit/                # UI components
-├── Helper-project/
-│   ├── HoloRay/               # Python SDK and demos
-│   └── Magnus AI/            # Additional AI tools
 └── docs/                      # Documentation
 ```
 
@@ -134,11 +136,8 @@ Hypervision/
    ```
 
 3. **Start the detection server** (optional, for YOLO features)
-   ```bash
-   cd Helper-project/HoloRay/detection_server
-   pip install -r requirements.txt
-   python server.py
-   ```
+   
+   The detection server is available locally in the Helper-project directory. See the detection server README for setup instructions.
 
 4. **Run Firebase emulators** (for multiplayer features)
    ```bash
@@ -184,8 +183,6 @@ Combines multiple tracking methods for maximum robustness:
 - [Architecture Overview](docs/architecture.md)
 - [API Documentation](docs/api.md)
 - [Data Model](docs/data-model.md)
-- [Integration Guide](Helper-project/HoloRay/docs/INTEGRATION_GUIDE.md)
-- [HoloRay SDK Modules](Helper-project/HoloRay/docs/MODULES.md)
 
 ## 🔧 Development
 

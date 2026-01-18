@@ -26,3 +26,6 @@ firestore-debug.log
 serviceAccountKey.json
 *.json.key
 
+# Helper projects (local development only)
+Helper-project/
+
