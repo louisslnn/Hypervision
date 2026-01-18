@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "paths": {
+      "@hypervision/chess-domain": ["../../packages/chess-domain/dist"]
+    }
+  },
+  "exclude": ["**/*.test.ts"]
+}

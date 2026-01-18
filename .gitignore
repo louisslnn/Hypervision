@@ -1,0 +1,28 @@
+node_modules/
+.DS_Store
+.env
+.env.local
+.env.*.local
+.next/
+dist/
+coverage/
+playwright-report/
+.firebase/
+.firestore/
+.emulators/
+
+# Turborepo
+.turbo/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Firebase
+firebase-debug.log
+firestore-debug.log
+serviceAccountKey.json
+*.json.key
+

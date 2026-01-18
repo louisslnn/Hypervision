@@ -1,0 +1,39 @@
+{
+  "name": "hypervision-ar",
+  "private": true,
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev": "pnpm --filter @hypervision/ar-chess-web dev",
+    "emulators": "pnpm --filter @hypervision/firebase-functions emulators",
+    "lint": "turbo lint",
+    "format": "turbo format",
+    "format:check": "turbo format:check",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test --concurrency=1",
+    "build": "turbo build",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.0",
+    "@typescript-eslint/eslint-plugin": "^8.4.0",
+    "@typescript-eslint/parser": "^8.4.0",
+    "eslint": "^9.9.0",
+    "eslint-plugin-import": "^2.30.0",
+    "eslint-plugin-jsx-a11y": "^6.9.0",
+    "eslint-plugin-react": "^7.35.0",
+    "eslint-plugin-react-hooks": "^4.6.2",
+    "eslint-plugin-unused-imports": "^4.1.4",
+    "firebase-tools": "^13.15.0",
+    "husky": "^9.1.4",
+    "lint-staged": "^15.2.9",
+    "prettier": "^3.3.3",
+    "turbo": "^2.1.1",
+    "typescript-eslint": "^8.53.0",
+    "typescript": "^5.5.4"
+  },
+  "lint-staged": {
+    "**/*.{ts,tsx,js,jsx,json,md,css,scss}": [
+      "prettier --write"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@hypervision/ar-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint src --max-warnings=0",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.18"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.5"
+  }
+}

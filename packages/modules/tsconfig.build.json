@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "paths": {
+      "@hypervision/ar-core": ["../ar-core/dist"]
+    }
+  },
+  "exclude": ["**/*.test.ts", "**/*.test.tsx"]
+}

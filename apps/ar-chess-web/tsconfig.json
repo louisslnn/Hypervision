@@ -1,0 +1,58 @@
+{
+  "extends": "../../config/tsconfig/tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2022"
+    ],
+    "jsx": "preserve",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "incremental": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "src/*"
+      ],
+      "@hypervision/ar-core": [
+        "../../packages/ar-core/src"
+      ],
+      "@hypervision/chess-domain": [
+        "../../packages/chess-domain/src"
+      ],
+      "@hypervision/engine": [
+        "../../packages/engine/src"
+      ],
+      "@hypervision/modules": [
+        "../../packages/modules/src"
+      ],
+      "@hypervision/ui-kit": [
+        "../../packages/ui-kit/src"
+      ],
+      "stockfish": [
+        "../../packages/engine/src/stockfish.d.ts"
+      ],
+      "stockfish/src/stockfish-17.1-lite-single-03e3232.js": [
+        "../../packages/engine/src/stockfish.d.ts"
+      ]
+    },
+    "esModuleInterop": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "src",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

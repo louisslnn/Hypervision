@@ -1,0 +1,32 @@
+{
+  "name": "@hypervision/firebase-functions",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "20"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint src --max-warnings=0",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm test:unit && pnpm test:integration",
+    "test:unit": "vitest run",
+    "test:integration": "pnpm --filter @hypervision/chess-domain build && pnpm build && pnpm exec firebase --config ../../firebase.json emulators:exec --project hypervision-demo \"pnpm exec vitest run --config vitest.integration.config.ts\"",
+    "emulators": "pnpm exec firebase --config ../../firebase.json emulators:start --project hypervision-demo"
+  },
+  "dependencies": {
+    "chess.js": "^1.0.0",
+    "firebase-admin": "^12.5.0",
+    "firebase-functions": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.11",
+    "firebase": "^10.13.1",
+    "vitest": "^2.0.5"
+  }
+}
