@@ -21,7 +21,14 @@ import {
   TrackerState,
   LabelStatus
 } from "../shared/clickTracking";
-import { useDetectionClient, drawDetections, DetectionMode } from "../shared/detectionClient";
+import {
+  useDetectionClient,
+  drawDetections,
+  DetectionMode,
+  type Detection
+} from "../shared/detectionClient";
+import { useWebRtcCollab, WebRtcRole } from "../shared/webrtcCollab";
+import type { CollabMessage } from "../shared/webrtcCollab";
 
 // Server detection configuration
 const DETECTION_SERVER_URL =
@@ -30,11 +37,47 @@ const DETECTION_SERVER_URL =
       "ws://localhost:8765/ws/detect")
     : "ws://localhost:8765/ws/detect";
 
+const SIGNAL_SERVER_URL =
+  typeof window !== "undefined"
+    ? ((window as { ENV_SIGNAL_SERVER?: string }).ENV_SIGNAL_SERVER ?? "ws://localhost:9001")
+    : "ws://localhost:9001";
+
 type AnnotationStyle = "minimal" | "standard" | "detailed" | "gaming";
 
 type TrackingMode = "single" | "multi";
 
+type VideoSource = "camera" | "demo" | "file" | "webrtc";
+
 type AlertType = "motion" | "zone" | "lost" | "info";
+
+type CollabTracker = {
+  id: string;
+  label: string;
+  color: string;
+  x: number;
+  y: number;
+};
+
+type CollabAction =
+  | { type: "tracker:add"; payload: CollabTracker }
+  | { type: "tracker:update"; payload: { id: string; label: string } }
+  | { type: "tracker:remove"; payload: { id: string } }
+  | { type: "session:toggle"; payload: { active: boolean } }
+  | { type: "reset" }
+  | { type: "state:sync"; payload: { sessionActive: boolean; trackers: CollabTracker[] } };
+
+type AddTrackerOptions = {
+  id?: string;
+  label?: string;
+  color?: string;
+  broadcast?: boolean;
+  skipAutoIdentify?: boolean;
+  forceMulti?: boolean;
+  silent?: boolean;
+  detectorTrackId?: string;
+  detectorLabel?: string;
+  detectorConfidence?: number;
+};
 
 interface Alert {
   id: string;
@@ -56,6 +99,26 @@ const MODE_LABELS: Record<TrackingMode, string> = {
   single: "Single Target",
   multi: "Multi Target"
 };
+
+const DEMO_CLIPS: Array<{
+  id: string;
+  label: string;
+  url: string;
+  note: string;
+}> = [
+  {
+    id: "opencv-vtest",
+    label: "OpenCV Sample (vtest)",
+    url: "/securewatch/clips/opencv-vtest-25s.mp4",
+    note: "Outdoor pedestrians in a static scene."
+  },
+  {
+    id: "opencv-vid00003",
+    label: "OpenCV Extra (VID00003)",
+    url: "/securewatch/clips/opencv-vid00003-25s.mp4",
+    note: "Street-level motion with multiple people."
+  }
+];
 
 const UI_UPDATE_MS = 160;
 const ALERT_LIMIT = 12;
@@ -248,6 +311,52 @@ const styles = {
     padding: "6px 10px",
     fontSize: "0.85rem"
   } as React.CSSProperties,
+  input: {
+    width: "100%",
+    background: "rgba(255, 255, 255, 0.08)",
+    border: "1px solid rgba(255, 255, 255, 0.12)",
+    color: "white",
+    borderRadius: "6px",
+    padding: "6px 10px",
+    fontSize: "0.85rem"
+  } as React.CSSProperties,
+  fieldStack: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: "6px"
+  } as React.CSSProperties,
+  fieldLabel: {
+    fontSize: "0.75rem",
+    color: "rgba(255,255,255,0.6)"
+  } as React.CSSProperties,
+  fieldHint: {
+    fontSize: "0.72rem",
+    color: "rgba(255,255,255,0.5)"
+  } as React.CSSProperties,
+  statusRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    flexWrap: "wrap" as const
+  } as React.CSSProperties,
+  statusDotSmall: {
+    width: "8px",
+    height: "8px",
+    borderRadius: "50%"
+  } as React.CSSProperties,
+  pill: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "4px 8px",
+    borderRadius: "999px",
+    fontSize: "0.7rem",
+    background: "rgba(255,255,255,0.1)"
+  } as React.CSSProperties,
+  mutedText: {
+    fontSize: "0.75rem",
+    color: "rgba(255,255,255,0.5)"
+  } as React.CSSProperties,
   trackerList: {
     display: "flex",
     flexDirection: "column" as const,
@@ -381,18 +490,177 @@ const styles = {
   } as React.CSSProperties
 };
 
+function createRoomCode(): string {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+function createTrackerId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `tracker-${crypto.randomUUID()}`;
+  }
+  return `tracker-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function getDetectionBox(detection: Detection): Detection["bbox"] {
+  const withInterpolation = detection as Detection & { interpolatedBox?: Detection["bbox"] };
+  return withInterpolation.interpolatedBox ?? detection.bbox;
+}
+
+function formatDetectorLabel(label: string, trackerNumber: number): string {
+  const trimmed = label.trim();
+  if (!trimmed) {
+    return `Subject ${trackerNumber}`;
+  }
+  const normalized = `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
+  return `${normalized} ${trackerNumber}`;
+}
+
+function pickDetectionForPoint(
+  detections: Detection[],
+  x: number,
+  y: number,
+  config: ReturnType<typeof buildTrackingConfig>
+): Detection | null {
+  let bestInside: { detection: Detection; score: number } | null = null;
+  let bestNearby: { detection: Detection; distance: number } | null = null;
+
+  detections.forEach((det) => {
+    const box = getDetectionBox(det);
+    const centerX = box.centerX * config.analysisWidth;
+    const centerY = box.centerY * config.analysisHeight;
+    const halfW = (box.width * config.analysisWidth) / 2;
+    const halfH = (box.height * config.analysisHeight) / 2;
+    const inside =
+      x >= centerX - halfW &&
+      x <= centerX + halfW &&
+      y >= centerY - halfH &&
+      y <= centerY + halfH;
+
+    if (inside) {
+      const score = det.confidence;
+      if (!bestInside || score > bestInside.score) {
+        bestInside = { detection: det, score };
+      }
+    } else {
+      const distance = Math.hypot(centerX - x, centerY - y);
+      if (!bestNearby || distance < bestNearby.distance) {
+        bestNearby = { detection: det, distance };
+      }
+    }
+  });
+
+  if (bestInside) {
+    return bestInside.detection;
+  }
+
+  if (bestNearby && bestNearby.distance <= config.searchRadius * 1.5) {
+    return bestNearby.detection;
+  }
+
+  return null;
+}
+
+function parseCollabAction(message: CollabMessage): CollabAction | null {
+  if (message.type === "reset") {
+    return { type: "reset" };
+  }
+
+  if (!isRecord(message.payload)) {
+    return null;
+  }
+
+  if (message.type === "tracker:add") {
+    const { id, label, color, x, y } = message.payload;
+    if (isString(id) && isString(label) && isString(color) && isNumber(x) && isNumber(y)) {
+      return { type: "tracker:add", payload: { id, label, color, x, y } };
+    }
+    return null;
+  }
+
+  if (message.type === "tracker:update") {
+    const { id, label } = message.payload;
+    if (isString(id) && isString(label)) {
+      return { type: "tracker:update", payload: { id, label } };
+    }
+    return null;
+  }
+
+  if (message.type === "tracker:remove") {
+    const { id } = message.payload;
+    if (isString(id)) {
+      return { type: "tracker:remove", payload: { id } };
+    }
+    return null;
+  }
+
+  if (message.type === "session:toggle") {
+    const { active } = message.payload;
+    if (typeof active === "boolean") {
+      return { type: "session:toggle", payload: { active } };
+    }
+    return null;
+  }
+
+  if (message.type === "state:sync") {
+    const { sessionActive, trackers } = message.payload;
+    if (typeof sessionActive !== "boolean" || !Array.isArray(trackers)) {
+      return null;
+    }
+
+    const normalizedTrackers: CollabTracker[] = [];
+    trackers.forEach((tracker) => {
+      if (!isRecord(tracker)) return;
+      const { id, label, color, x, y } = tracker;
+      if (isString(id) && isString(label) && isString(color) && isNumber(x) && isNumber(y)) {
+        normalizedTrackers.push({ id, label, color, x, y });
+      }
+    });
+
+    return {
+      type: "state:sync",
+      payload: { sessionActive, trackers: normalizedTrackers }
+    };
+  }
+
+  return null;
+}
+
 interface SecureWatchProps {
   openaiApiKey?: string | undefined;
   detectionServerUrl?: string;
+  signalServerUrl?: string;
 }
 
-export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchProps = {}) {
+export function SecureWatch({
+  openaiApiKey,
+  detectionServerUrl,
+  signalServerUrl
+}: SecureWatchProps = {}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const [cameraReady, setCameraReady] = useState(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [videoReady, setVideoReady] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoSource, setVideoSource] = useState<VideoSource>("camera");
+  const [demoClipId, setDemoClipId] = useState<string>(DEMO_CLIPS[0]?.id ?? "demo");
+  const [fileUrl, setFileUrl] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [shareStream, setShareStream] = useState<MediaStream | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
   const [trackers, setTrackers] = useState<ClickTracker[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -409,6 +677,21 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   const [motionDetection, setMotionDetection] = useState(true);
   const [zoneAlerts, setZoneAlerts] = useState(true);
 
+  const [collabEnabled, setCollabEnabled] = useState(false);
+  const [collabRoomId, setCollabRoomId] = useState<string>(() => createRoomCode());
+  const [collabRole, setCollabRole] = useState<WebRtcRole>("host");
+  const [collabServerUrl, setCollabServerUrl] = useState<string>(
+    signalServerUrl ?? SIGNAL_SERVER_URL
+  );
+
+  const selectedClip = DEMO_CLIPS.find((clip) => clip.id === demoClipId) ?? DEMO_CLIPS[0];
+
+  useEffect(() => {
+    if (signalServerUrl) {
+      setCollabServerUrl(signalServerUrl);
+    }
+  }, [signalServerUrl]);
+
   // Server-based detection state
   const [useServerDetection, setUseServerDetection] = useState(false);
   const [showServerDetections, setShowServerDetections] = useState(true);
@@ -424,13 +707,14 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   } = useDetectionClient({
     serverUrl,
     mode: detectionMode,
-    enabled: useServerDetection && sessionActive && cameraReady,
+    enabled: useServerDetection && sessionActive && videoReady,
     targetFps: 12,
     confidenceThreshold: 0.35
   });
 
   const trackersRef = useRef<ClickTracker[]>([]);
   const alertsRef = useRef<Alert[]>([]);
+  const interpolatedDetectionsRef = useRef<Detection[]>([]);
   const configRef = useRef<ReturnType<typeof buildTrackingConfig> | null>(null);
   const prevLumaRef = useRef<Uint8ClampedArray | null>(null);
   const frameCountRef = useRef(0);
@@ -445,6 +729,11 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   const zoneAlertsRef = useRef(zoneAlerts);
   const profileRef = useRef(profile);
   const zoneMapRef = useRef(new Map<string, string>());
+  const fileUrlRef = useRef<string | null>(null);
+  const collabSendRef = useRef<(message: { type: string; payload?: Record<string, unknown> }) => void>(
+    () => undefined
+  );
+  const pendingCollabRef = useRef<CollabAction[]>([]);
 
   useEffect(() => {
     trackersRef.current = trackers;
@@ -453,6 +742,10 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   useEffect(() => {
     alertsRef.current = alerts;
   }, [alerts]);
+
+  useEffect(() => {
+    interpolatedDetectionsRef.current = interpolatedDetections;
+  }, [interpolatedDetections]);
 
   useEffect(() => {
     sessionActiveRef.current = sessionActive;
@@ -471,9 +764,42 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   }, [profile]);
 
   useEffect(() => {
-    let active = true;
     const video = videoRef.current;
     if (!video) return;
+
+    const handleCanPlay = () => setVideoReady(true);
+    const handlePlaying = () => setIsVideoPlaying(true);
+    const handlePause = () => setIsVideoPlaying(false);
+    const handleEnded = () => setIsVideoPlaying(false);
+    const handleError = () => {
+      setVideoError("Video playback failed. Please check the selected source.");
+    };
+
+    video.addEventListener("canplay", handleCanPlay);
+    video.addEventListener("loadedmetadata", handleCanPlay);
+    video.addEventListener("playing", handlePlaying);
+    video.addEventListener("pause", handlePause);
+    video.addEventListener("ended", handleEnded);
+    video.addEventListener("error", handleError);
+
+    return () => {
+      video.removeEventListener("canplay", handleCanPlay);
+      video.removeEventListener("loadedmetadata", handleCanPlay);
+      video.removeEventListener("playing", handlePlaying);
+      video.removeEventListener("pause", handlePause);
+      video.removeEventListener("ended", handleEnded);
+      video.removeEventListener("error", handleError);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (videoSource !== "camera") {
+      setCameraStream(null);
+      return;
+    }
+
+    let active = true;
+    let localStream: MediaStream | null = null;
 
     navigator.mediaDevices
       .getUserMedia({
@@ -488,14 +814,13 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
-        video.srcObject = stream;
-        video.play().catch(() => undefined);
-        setCameraReady(true);
-        setCameraError(null);
+        localStream = stream;
+        setCameraStream(stream);
+        setVideoError(null);
       })
       .catch((err) => {
         if (active) {
-          setCameraError(
+          setVideoError(
             err.name === "NotAllowedError"
               ? "Camera access denied. Please allow camera access."
               : "Failed to access camera. Please check your device."
@@ -505,8 +830,18 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
 
     return () => {
       active = false;
-      const stream = video.srcObject as MediaStream | null;
-      stream?.getTracks().forEach((t) => t.stop());
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, [videoSource]);
+
+  useEffect(() => {
+    return () => {
+      if (fileUrlRef.current) {
+        URL.revokeObjectURL(fileUrlRef.current);
+        fileUrlRef.current = null;
+      }
     };
   }, []);
 
@@ -521,26 +856,58 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
     setAlerts((prev) => [alert, ...prev].slice(0, ALERT_LIMIT));
   }, []);
 
-  const resetAll = useCallback(() => {
-    setTrackers([]);
-    trackersRef.current = [];
-    setAlerts([]);
-    alertsRef.current = [];
-    setSelectedTracker(null);
-    prevLumaRef.current = null;
-    zoneMapRef.current.clear();
-    addAlert("info", "System reset");
-  }, [addAlert]);
+  const resetAll = useCallback(
+    (options?: { silent?: boolean; broadcast?: boolean }) => {
+      setTrackers([]);
+      trackersRef.current = [];
+      setAlerts([]);
+      alertsRef.current = [];
+      setSelectedTracker(null);
+      prevLumaRef.current = null;
+      zoneMapRef.current.clear();
+      setQualityScore(0);
+      setMotionScore(0);
+      setTrackingFps(0);
+
+      if (!options?.silent) {
+        addAlert("info", "System reset");
+      }
+
+      if ((options?.broadcast ?? true) && collabEnabled) {
+        collabSendRef.current({ type: "reset" });
+      }
+    },
+    [addAlert, collabEnabled]
+  );
+
+  const setSessionState = useCallback(
+    (nextActive: boolean, options?: { broadcast?: boolean; silent?: boolean; reason?: string }) => {
+      setSessionActive(nextActive);
+
+      if (nextActive && videoRef.current?.paused) {
+        videoRef.current.play().catch(() => undefined);
+      }
+
+      if (!options?.silent) {
+        addAlert(
+          "info",
+          options?.reason ?? (nextActive ? "Monitoring started" : "Monitoring paused")
+        );
+      }
+
+      if ((options?.broadcast ?? true) && collabEnabled) {
+        collabSendRef.current({
+          type: "session:toggle",
+          payload: { active: nextActive }
+        });
+      }
+    },
+    [addAlert, collabEnabled]
+  );
 
   const toggleSession = useCallback(() => {
-    if (sessionActiveRef.current) {
-      setSessionActive(false);
-      addAlert("info", "Monitoring paused");
-    } else {
-      setSessionActive(true);
-      addAlert("info", "Monitoring started");
-    }
-  }, [addAlert]);
+    setSessionState(!sessionActiveRef.current);
+  }, [setSessionState]);
 
   const cycleStyle = useCallback(() => {
     setAnnotationStyle((prev) => {
@@ -557,10 +924,54 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
     [resetAll]
   );
 
+  const handleVideoSourceChange = useCallback((nextSource: VideoSource) => {
+    setVideoSource(nextSource);
+  }, []);
+
+  const handleDemoClipChange = useCallback((clipId: string) => {
+    setDemoClipId(clipId);
+    setVideoSource("demo");
+  }, []);
+
+  const handleFileSelect = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (fileUrlRef.current) {
+      URL.revokeObjectURL(fileUrlRef.current);
+    }
+
+    const url = URL.createObjectURL(file);
+    fileUrlRef.current = url;
+    setFileUrl(url);
+    setFileName(file.name);
+    setVideoSource("file");
+    setVideoError(null);
+  }, []);
+
+  const handlePlaybackToggle = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      video.play().catch(() => undefined);
+    } else {
+      video.pause();
+    }
+  }, []);
+
+  const handlePlaybackRestart = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.currentTime = 0;
+    video.play().catch(() => undefined);
+  }, []);
+
   const removeTracker = useCallback(
-    (id: string) => {
+    (id: string, options?: { silent?: boolean; broadcast?: boolean }) => {
       const tracker = trackersRef.current.find((t) => t.id === id);
-      if (tracker) {
+      if (tracker && !options?.silent) {
         addAlert("lost", `Tracker removed: ${tracker.label}`);
       }
       trackersRef.current = trackersRef.current.filter((t) => t.id !== id);
@@ -569,8 +980,12 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         setSelectedTracker(null);
       }
       zoneMapRef.current.delete(id);
+
+      if ((options?.broadcast ?? true) && collabEnabled) {
+        collabSendRef.current({ type: "tracker:remove", payload: { id } });
+      }
     },
-    [addAlert, selectedTracker]
+    [addAlert, collabEnabled, selectedTracker]
   );
 
   const ensureTrackingConfig = useCallback((video: HTMLVideoElement) => {
@@ -605,7 +1020,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   }, []);
 
   const captureLumaFrame = useCallback(
-    (video: HTMLVideoElement, config: ReturnType<typeof buildTrackingConfig>) => {
+    (video: HTMLVideoElement, config: ReturnType<typeof buildTrackingConfig>, mirror: boolean) => {
       const canvas = analysisCanvasRef.current;
       if (!canvas) {
         return null;
@@ -615,11 +1030,15 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         return null;
       }
 
-      ctx.save();
-      ctx.translate(config.analysisWidth, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, 0, 0, config.analysisWidth, config.analysisHeight);
-      ctx.restore();
+      if (mirror) {
+        ctx.save();
+        ctx.translate(config.analysisWidth, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, config.analysisWidth, config.analysisHeight);
+        ctx.restore();
+      } else {
+        ctx.drawImage(video, 0, 0, config.analysisWidth, config.analysisHeight);
+      }
 
       const imageData = ctx.getImageData(0, 0, config.analysisWidth, config.analysisHeight);
       return buildLumaFrame(imageData);
@@ -628,28 +1047,55 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
   );
 
   const addTrackerAt = useCallback(
-    async (x: number, y: number) => {
+    async (x: number, y: number, options: AddTrackerOptions = {}) => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       if (!video || !canvas) {
         return;
       }
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        return;
+      }
+
+      if (options.id && trackersRef.current.some((tracker) => tracker.id === options.id)) {
+        return;
+      }
+
       const config = configRef.current ?? ensureTrackingConfig(video);
       if (!config) {
         return;
       }
-      const luma = captureLumaFrame(video, config);
+      const luma = captureLumaFrame(video, config, videoSource === "camera");
       if (!luma) {
         return;
       }
-      const id = `tracker-${Date.now()}`;
-      const colorIndex = trackersRef.current.length % COLORS.length;
-      const color = COLORS[colorIndex] ?? "#10b981";
-      const trackerNumber = trackersRef.current.length + 1;
 
+      const detectionCandidate =
+        useServerDetection &&
+        interpolatedDetectionsRef.current.length > 0 &&
+        !options.detectorTrackId
+          ? pickDetectionForPoint(interpolatedDetectionsRef.current, x, y, config)
+          : null;
+      const detectorTrackId =
+        options.detectorTrackId ?? detectionCandidate?.trackId ?? detectionCandidate?.id;
+      const detectorLabel = options.detectorLabel ?? detectionCandidate?.label;
+      const detectorConfidence =
+        options.detectorConfidence ?? detectionCandidate?.confidence ?? undefined;
+
+      const id = options.id ?? createTrackerId();
+      const trackerNumber = trackersRef.current.length + 1;
+      const color =
+        options.color ?? COLORS[trackersRef.current.length % COLORS.length] ?? "#10b981";
+      const label =
+        options.label ??
+        (detectorLabel
+          ? formatDetectorLabel(detectorLabel, trackerNumber)
+          : `Subject ${trackerNumber}`);
+
+      const now = Date.now();
       const tracker = createTracker({
         id,
-        label: `Subject ${trackerNumber}`,
+        label,
         color,
         x,
         y,
@@ -657,23 +1103,34 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         width: config.analysisWidth,
         height: config.analysisHeight,
         config,
-        now: Date.now()
+        now
       });
 
       if (!tracker) {
-        addAlert("info", "Target too close to edge. Try clicking a clearer area.");
+        if (!options.silent) {
+          addAlert("info", "Target too close to edge. Try clicking a clearer area.");
+        }
         return;
       }
 
-      // Store initial position for re-acquisition
       tracker.lastGoodPosition = { x: tracker.x, y: tracker.y };
+      if (detectorTrackId) {
+        tracker.detectorTrackId = detectorTrackId;
+        tracker.detectorLabel = detectorLabel;
+        tracker.detectorConfidence = detectorConfidence;
+        tracker.detectorMisses = 0;
+        tracker.lastDetectorAt = now;
+      }
 
-      if (trackingMode === "single") {
+      const allowMulti = options.forceMulti || trackingMode === "multi";
+      if (!allowMulti) {
         trackersRef.current = [tracker];
         setSelectedTracker(tracker.id);
       } else {
         if (trackersRef.current.length >= config.maxTrackers) {
-          addAlert("info", "Maximum tracker count reached.");
+          if (!options.silent) {
+            addAlert("info", "Maximum tracker count reached.");
+          }
           return;
         }
         trackersRef.current = [...trackersRef.current, tracker];
@@ -681,27 +1138,50 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
       }
 
       setTrackers([...trackersRef.current]);
-      addAlert("zone", `Tracking locked on ${tracker.label}`, tracker.id);
+      if (!options.silent) {
+        addAlert("zone", `Tracking locked on ${tracker.label}`, tracker.id);
+      }
 
-      // AUTO-IDENTIFY: If we have an API key and auto-identify is enabled,
-      // immediately identify the object for object-aware tracking
-      if (AI_TRACKING_CONFIG.AUTO_IDENTIFY_ON_PLACEMENT && openaiApiKey && canvas) {
-        // Set status to "thinking" while identifying
+      if ((options.broadcast ?? true) && collabEnabled) {
+        collabSendRef.current({
+          type: "tracker:add",
+          payload: {
+            id: tracker.id,
+            label: tracker.label,
+            color: tracker.color,
+            x: tracker.x / config.analysisWidth,
+            y: tracker.y / config.analysisHeight
+          }
+        });
+      }
+
+      if (
+        !options.skipAutoIdentify &&
+        AI_TRACKING_CONFIG.AUTO_IDENTIFY_ON_PLACEMENT &&
+        openaiApiKey &&
+        canvas
+      ) {
         const updateTrackerLabel = (
-          label: string,
+          nextLabel: string,
           status: LabelStatus,
           extras?: Partial<ClickTracker>
         ) => {
           trackersRef.current = trackersRef.current.map((t) =>
-            t.id === id ? { ...t, labelStatus: status, label, ...extras } : t
+            t.id === id ? { ...t, labelStatus: status, label: nextLabel, ...extras } : t
           );
           setTrackers([...trackersRef.current]);
+
+          if ((options.broadcast ?? true) && collabEnabled && status === "labeled") {
+            collabSendRef.current({
+              type: "tracker:update",
+              payload: { id, label: nextLabel }
+            });
+          }
         };
 
         updateTrackerLabel("Identifying...", "thinking");
 
         try {
-          // Scale coordinates from analysis space to display space for AI
           const scaleX = canvas.width / config.analysisWidth;
           const scaleY = canvas.height / config.analysisHeight;
           const displayX = x * scaleX;
@@ -709,7 +1189,6 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
 
           const result = await identifyObjectWithFeatures(canvas, displayX, displayY, openaiApiKey);
 
-          // Update tracker with full object information
           updateTrackerLabel(result.label, "labeled", {
             objectDescription: result.description,
             visualFeatures: result.features,
@@ -722,17 +1201,247 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
           addAlert("info", `Identified: ${result.label}`, id);
         } catch (err) {
           console.error("[AI Security] Auto-identify failed:", err);
-          // Revert to default label
-          updateTrackerLabel(`Subject ${trackerNumber}`, "idle");
+          updateTrackerLabel(label, "idle");
         }
       }
     },
-    [addAlert, captureLumaFrame, ensureTrackingConfig, trackingMode, openaiApiKey]
+    [
+      addAlert,
+      captureLumaFrame,
+      collabEnabled,
+      ensureTrackingConfig,
+      openaiApiKey,
+      trackingMode,
+      useServerDetection,
+      videoSource
+    ]
   );
+
+  const applyCollabAction = useCallback(
+    async (action: CollabAction) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const config = configRef.current ?? ensureTrackingConfig(video);
+      if (!config) return;
+
+      switch (action.type) {
+        case "tracker:add": {
+          const x = action.payload.x * config.analysisWidth;
+          const y = action.payload.y * config.analysisHeight;
+          await addTrackerAt(x, y, {
+            id: action.payload.id,
+            label: action.payload.label,
+            color: action.payload.color,
+            broadcast: false,
+            skipAutoIdentify: true,
+            forceMulti: true,
+            silent: true
+          });
+          break;
+        }
+        case "tracker:update":
+          trackersRef.current = trackersRef.current.map((tracker) =>
+            tracker.id === action.payload.id ? { ...tracker, label: action.payload.label } : tracker
+          );
+          setTrackers([...trackersRef.current]);
+          break;
+        case "tracker:remove":
+          removeTracker(action.payload.id, { silent: true, broadcast: false });
+          break;
+        case "reset":
+          resetAll({ silent: true, broadcast: false });
+          break;
+        case "session:toggle":
+          setSessionState(action.payload.active, {
+            broadcast: false,
+            reason: action.payload.active
+              ? "Monitoring started by collaborator"
+              : "Monitoring paused by collaborator"
+          });
+          break;
+        case "state:sync":
+          resetAll({ silent: true, broadcast: false });
+          for (const tracker of action.payload.trackers) {
+            const nextX = tracker.x * config.analysisWidth;
+            const nextY = tracker.y * config.analysisHeight;
+            await addTrackerAt(nextX, nextY, {
+              id: tracker.id,
+              label: tracker.label,
+              color: tracker.color,
+              broadcast: false,
+              skipAutoIdentify: true,
+              forceMulti: true,
+              silent: true
+            });
+          }
+          setSessionState(action.payload.sessionActive, {
+            broadcast: false,
+            silent: true
+          });
+          break;
+      }
+    },
+    [addTrackerAt, ensureTrackingConfig, removeTracker, resetAll, setSessionState]
+  );
+
+  const handleCollabMessage = useCallback(
+    (message: CollabMessage) => {
+      const action = parseCollabAction(message);
+      if (!action) return;
+
+      const video = videoRef.current;
+      if (!video || !videoReady || video.videoWidth === 0) {
+        pendingCollabRef.current.push(action);
+        return;
+      }
+
+      void applyCollabAction(action);
+    },
+    [applyCollabAction, videoReady]
+  );
+
+  const collab = useWebRtcCollab({
+    enabled: collabEnabled,
+    serverUrl: collabServerUrl,
+    roomId: collabRoomId,
+    role: collabRole,
+    localStream: shareStream,
+    onMessage: handleCollabMessage
+  });
+
+  useEffect(() => {
+    collabSendRef.current = collab.sendMessage;
+  }, [collab.sendMessage]);
+
+  useEffect(() => {
+    if (!videoReady || pendingCollabRef.current.length === 0) return;
+    const queue = [...pendingCollabRef.current];
+    pendingCollabRef.current = [];
+    queue.forEach((action) => {
+      void applyCollabAction(action);
+    });
+  }, [applyCollabAction, videoReady]);
+
+  useEffect(() => {
+    if (collabEnabled && trackingMode !== "multi") {
+      setTrackingMode("multi");
+    }
+  }, [collabEnabled, trackingMode]);
+
+  useEffect(() => {
+    if (!collab.dataChannelOpen || collabRole !== "host" || !videoReady) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    const config = configRef.current ?? ensureTrackingConfig(video);
+    if (!config) return;
+
+    const payload = {
+      sessionActive: sessionActiveRef.current,
+      trackers: trackersRef.current.map((tracker) => ({
+        id: tracker.id,
+        label: tracker.label,
+        color: tracker.color,
+        x: tracker.x / config.analysisWidth,
+        y: tracker.y / config.analysisHeight
+      }))
+    };
+
+    collab.sendMessage({ type: "state:sync", payload });
+  }, [collab.dataChannelOpen, collabRole, collab.sendMessage, ensureTrackingConfig, videoReady]);
+
+  useEffect(() => {
+    setSessionActive(false);
+    resetAll({ silent: true, broadcast: false });
+    pendingCollabRef.current = [];
+    if (shareStream && shareStream !== cameraStream) {
+      shareStream.getTracks().forEach((track) => track.stop());
+      setShareStream(null);
+    }
+  }, [cameraStream, demoClipId, fileUrl, resetAll, shareStream, videoSource]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    setVideoReady(false);
+    setVideoError(null);
+    setIsVideoPlaying(false);
+
+    if (video.srcObject) {
+      video.srcObject = null;
+    }
+    if (video.src) {
+      video.removeAttribute("src");
+    }
+
+    video.loop = false;
+
+    if (videoSource === "camera") {
+      if (!cameraStream) {
+        return;
+      }
+      video.srcObject = cameraStream;
+    } else if (videoSource === "demo") {
+      if (!selectedClip) {
+        setVideoError("Demo clip not found.");
+        return;
+      }
+      video.src = selectedClip.url;
+      video.loop = true;
+    } else if (videoSource === "file") {
+      if (!fileUrl) {
+        setVideoError("Select a video file to play.");
+        return;
+      }
+      video.src = fileUrl;
+    } else if (videoSource === "webrtc") {
+      if (!collab.remoteStream) {
+        return;
+      }
+      video.srcObject = collab.remoteStream;
+    }
+
+    video.play().catch(() => undefined);
+  }, [cameraStream, collab.remoteStream, fileUrl, selectedClip, videoSource]);
+
+  useEffect(() => {
+    if (!collabEnabled || collabRole !== "host") {
+      if (shareStream && shareStream !== cameraStream) {
+        shareStream.getTracks().forEach((track) => track.stop());
+      }
+      setShareStream(null);
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (videoSource === "camera" && cameraStream) {
+      if (shareStream !== cameraStream) {
+        setShareStream(cameraStream);
+      }
+      return;
+    }
+
+    if ((videoSource === "demo" || videoSource === "file") && videoReady) {
+      if (shareStream && shareStream !== cameraStream) {
+        return;
+      }
+      const captured = typeof video.captureStream === "function" ? video.captureStream() : null;
+      if (captured) {
+        setShareStream(captured);
+        return;
+      }
+    }
+
+    setShareStream(null);
+  }, [cameraStream, collabEnabled, collabRole, fileUrl, selectedClip, shareStream, videoReady, videoSource]);
 
   const handleCanvasClick = useCallback(
     (event: React.MouseEvent) => {
-      if (!cameraReady || !canvasRef.current || !sessionActiveRef.current) return;
+      if (!videoReady || !canvasRef.current || !sessionActiveRef.current) return;
       const config = configRef.current;
       if (!config) return;
       const rect = canvasRef.current.getBoundingClientRect();
@@ -760,7 +1469,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
 
       addTrackerAt(x, y);
     },
-    [addTrackerAt, cameraReady, removeTracker]
+    [addTrackerAt, removeTracker, videoReady]
   );
 
   const handleContextMenu = useCallback(
@@ -793,14 +1502,16 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
           setMotionDetection((prev) => !prev);
           break;
         case "t":
-          setTrackingMode((prev) => (prev === "multi" ? "single" : "multi"));
+          if (!collabEnabled) {
+            setTrackingMode((prev) => (prev === "multi" ? "single" : "multi"));
+          }
           break;
         case "p":
           setZoneAlerts((prev) => !prev);
           break;
         case " ":
         case "enter":
-          if (cameraReady) {
+          if (videoReady) {
             toggleSession();
           }
           event.preventDefault();
@@ -813,7 +1524,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [cameraReady, cycleStyle, resetAll, toggleSession]);
+  }, [collabEnabled, cycleStyle, resetAll, toggleSession, videoReady]);
 
   useEffect(() => {
     let rafId: number | null = null;
@@ -838,11 +1549,15 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         return;
       }
 
-      ctx.save();
-      ctx.translate(canvas.width, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      ctx.restore();
+      if (videoSource === "camera") {
+        ctx.save();
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
 
       frameCountRef.current += 1;
       const now = performance.now();
@@ -860,7 +1575,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         const interval = 1000 / config.targetFps;
         if (now - lastTrackingTickRef.current >= interval) {
           lastTrackingTickRef.current = now;
-          const luma = captureLumaFrame(video, config);
+          const luma = captureLumaFrame(video, config, videoSource === "camera");
           if (luma) {
             const motion = computeMotionScore(prevLumaRef.current, luma);
             prevLumaRef.current = motion.next;
@@ -881,9 +1596,20 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
             const scaleToAnalysis = (val: number, isX: boolean) =>
               val * (isX ? config.analysisWidth : config.analysisHeight);
 
+            const detectionsSnapshot = useServerDetection
+              ? interpolatedDetectionsRef.current
+              : [];
+            const normalizedDetections =
+              detectionsSnapshot.length > 0
+                ? detectionsSnapshot.map((det) => {
+                    const box = getDetectionBox(det);
+                    return { ...det, bbox: box };
+                  })
+                : [];
+
             const scaledDetections =
-              useServerDetection && interpolatedDetections.length > 0
-                ? interpolatedDetections.map((det) => ({
+              normalizedDetections.length > 0
+                ? normalizedDetections.map((det) => ({
                     ...det,
                     bbox: {
                       x1: scaleToAnalysis(det.bbox.x1, true),
@@ -907,18 +1633,26 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
               Date.now(),
               {
                 detections: scaledDetections,
-                yoloWeight: 0.35,
+                detectorEnabled: useServerDetection,
+                detectorDominant: useServerDetection,
+                yoloWeight: 0.65,
                 yoloReacquireRadius: config.searchRadius * 2.5
               }
             );
 
             trackersRef.current = update.trackers;
-            const avgConfidence =
-              update.trackers.length > 0
-                ? update.trackers.reduce((sum, tracker) => sum + tracker.confidence, 0) /
-                  update.trackers.length
-                : 0;
-            setQualityScore(Math.round(avgConfidence));
+            let nextQuality = 0;
+            if (update.trackers.length > 0) {
+              nextQuality =
+                update.trackers.reduce((sum, tracker) => sum + tracker.confidence, 0) /
+                update.trackers.length;
+            } else if (useServerDetection && normalizedDetections.length > 0) {
+              const detectionAvg =
+                normalizedDetections.reduce((sum, det) => sum + det.confidence, 0) /
+                normalizedDetections.length;
+              nextQuality = detectionAvg * 100;
+            }
+            setQualityScore(Math.round(nextQuality));
 
             update.stateChanges.forEach((change) => {
               if (change.to === "lost") {
@@ -1125,13 +1859,20 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
       );
 
       // Render server detection boxes (YOLO)
-      if (useServerDetection && showServerDetections && interpolatedDetections.length > 0) {
-        drawDetections(ctx, interpolatedDetections, canvas.width, canvas.height, {
-          lineWidth: 3,
-          showLabel: true,
-          showConfidence: true,
-          fontSize: 14
-        });
+      if (useServerDetection && showServerDetections) {
+        const detectionsSnapshot = interpolatedDetectionsRef.current;
+        if (detectionsSnapshot.length > 0) {
+          const normalizedDetections = detectionsSnapshot.map((det) => ({
+            ...det,
+            bbox: getDetectionBox(det)
+          }));
+          drawDetections(ctx, normalizedDetections, canvas.width, canvas.height, {
+            lineWidth: 3,
+            showLabel: true,
+            showConfidence: true,
+            fontSize: 14
+          });
+        }
       }
 
       rafId = requestAnimationFrame(render);
@@ -1152,7 +1893,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
     serverConnected,
     sendFrameToServer,
     showServerDetections,
-    interpolatedDetections
+    videoSource
   ]);
 
   const getStateStyle = (state: TrackerState): React.CSSProperties => {
@@ -1191,9 +1932,9 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
         </div>
       </div>
 
-      {cameraError && (
+      {videoError && (
         <div style={styles.errorBanner}>
-          <span>⚠️ {cameraError}</span>
+          <span>⚠️ {videoError}</span>
         </div>
       )}
 
@@ -1215,7 +1956,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
               </div>
             )}
 
-            {!sessionActive && cameraReady && (
+            {!sessionActive && videoReady && (
               <div style={styles.startOverlay}>
                 <button style={styles.startBtn} onClick={toggleSession}>
                   ▶ Start Monitoring
@@ -1237,7 +1978,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
             <button
               style={{ ...styles.ctrlBtn, ...(sessionActive ? styles.ctrlBtnActive : {}) }}
               onClick={toggleSession}
-              disabled={!cameraReady}
+              disabled={!videoReady}
             >
               {sessionActive ? "⏸ Pause" : "▶ Start"}
             </button>
@@ -1265,6 +2006,16 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
             <button style={styles.ctrlBtn} onClick={cycleStyle}>
               Style: {annotationStyle}
             </button>
+            {(videoSource === "demo" || videoSource === "file") && (
+              <>
+                <button style={styles.ctrlBtn} onClick={handlePlaybackToggle}>
+                  {isVideoPlaying ? "⏸ Video" : "▶ Video"}
+                </button>
+                <button style={styles.ctrlBtn} onClick={handlePlaybackRestart}>
+                  ↺ Restart
+                </button>
+              </>
+            )}
             <div
               style={{
                 width: "1px",
@@ -1380,6 +2131,141 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
 
         <div style={styles.sidePanel}>
           <div style={styles.panelSection}>
+            <h3 style={styles.panelTitle}>Video Source</h3>
+            <div style={styles.fieldStack}>
+              <label style={styles.fieldLabel}>Source</label>
+              <select
+                style={styles.select}
+                value={videoSource}
+                onChange={(event) => handleVideoSourceChange(event.target.value as VideoSource)}
+              >
+                <option value="camera">🎥 Camera</option>
+                <option value="demo">🎞 Demo clip</option>
+                <option value="file">📂 Upload file</option>
+                <option value="webrtc">🤝 WebRTC</option>
+              </select>
+            </div>
+
+            {videoSource === "demo" && (
+              <div style={{ ...styles.fieldStack, marginTop: "10px" }}>
+                <label style={styles.fieldLabel}>Clip</label>
+                <select
+                  style={styles.select}
+                  value={demoClipId}
+                  onChange={(event) => handleDemoClipChange(event.target.value)}
+                >
+                  {DEMO_CLIPS.map((clip) => (
+                    <option key={clip.id} value={clip.id}>
+                      {clip.label}
+                    </option>
+                  ))}
+                </select>
+                <span style={styles.fieldHint}>{selectedClip?.note}</span>
+              </div>
+            )}
+
+            {videoSource === "file" && (
+              <div style={{ ...styles.fieldStack, marginTop: "10px" }}>
+                <label style={styles.fieldLabel}>Upload</label>
+                <input
+                  type="file"
+                  accept="video/*"
+                  style={styles.input}
+                  onChange={handleFileSelect}
+                />
+                <span style={styles.fieldHint}>{fileName ?? "No file selected."}</span>
+              </div>
+            )}
+
+            {videoSource === "webrtc" && (
+              <div style={{ ...styles.fieldStack, marginTop: "10px" }}>
+                <span style={styles.fieldHint}>
+                  {collab.remoteStream ? "Remote stream active." : "Waiting for remote stream..."}
+                </span>
+              </div>
+            )}
+
+            <div style={{ ...styles.statusRow, marginTop: "10px" }}>
+              <span
+                style={{
+                  ...styles.statusDotSmall,
+                  background: videoReady ? "#10b981" : "rgba(255,255,255,0.3)"
+                }}
+              />
+              <span style={styles.mutedText}>
+                {videoReady ? "Video ready" : "Waiting for video"}
+              </span>
+            </div>
+          </div>
+
+          <div style={styles.panelSection}>
+            <h3 style={styles.panelTitle}>Collaboration</h3>
+            <div style={styles.fieldStack}>
+              <label style={styles.fieldLabel}>Role</label>
+              <select
+                style={styles.select}
+                value={collabRole}
+                onChange={(event) => setCollabRole(event.target.value as WebRtcRole)}
+                disabled={collabEnabled}
+              >
+                <option value="host">Host</option>
+                <option value="join">Join</option>
+              </select>
+            </div>
+            <div style={{ ...styles.fieldStack, marginTop: "10px" }}>
+              <label style={styles.fieldLabel}>Room</label>
+              <input
+                style={styles.input}
+                value={collabRoomId}
+                onChange={(event) => setCollabRoomId(event.target.value.toUpperCase())}
+                disabled={collabEnabled}
+              />
+            </div>
+            <div style={{ ...styles.fieldStack, marginTop: "10px" }}>
+              <label style={styles.fieldLabel}>Signal server</label>
+              <input
+                style={styles.input}
+                value={collabServerUrl}
+                onChange={(event) => setCollabServerUrl(event.target.value)}
+                disabled={collabEnabled}
+              />
+            </div>
+            <div style={{ ...styles.panelRow, marginTop: "10px" }}>
+              <button
+                style={{ ...styles.ctrlBtn, ...(collabEnabled ? styles.ctrlBtnActive : {}) }}
+                onClick={() => setCollabEnabled((prev) => !prev)}
+              >
+                {collabEnabled ? "Disconnect" : "Connect"}
+              </button>
+              {collab.remoteStream && videoSource !== "webrtc" && (
+                <button style={styles.ctrlBtn} onClick={() => setVideoSource("webrtc")}>
+                  Use remote stream
+                </button>
+              )}
+            </div>
+            <div style={{ ...styles.statusRow, marginTop: "10px" }}>
+              <span
+                style={{
+                  ...styles.statusDotSmall,
+                  background: collab.peerConnected ? "#10b981" : "rgba(255,255,255,0.3)"
+                }}
+              />
+              <span style={styles.mutedText}>
+                {collabEnabled
+                  ? collab.peerConnected
+                    ? "Peer connected"
+                    : "Waiting for peer"
+                  : "Offline"}
+              </span>
+              {collab.dataChannelOpen && <span style={styles.pill}>Data channel ready</span>}
+            </div>
+            {collab.lastError && <span style={styles.fieldHint}>{collab.lastError}</span>}
+            <span style={{ ...styles.fieldHint, marginTop: "8px" }}>
+              Host streams the current video source. Joiners can switch to WebRTC to view it.
+            </span>
+          </div>
+
+          <div style={styles.panelSection}>
             <h3 style={styles.panelTitle}>Tracking Controls</h3>
             <div style={styles.panelRow}>
               <label style={{ fontSize: "0.75rem", color: "rgba(255,255,255,0.6)" }}>Profile</label>
@@ -1401,6 +2287,7 @@ export function SecureWatch({ openaiApiKey, detectionServerUrl }: SecureWatchPro
                 style={styles.select}
                 value={trackingMode}
                 onChange={(event) => setTrackingMode(event.target.value as TrackingMode)}
+                disabled={collabEnabled}
               >
                 {Object.entries(MODE_LABELS).map(([value, label]) => (
                   <option key={value} value={value}>

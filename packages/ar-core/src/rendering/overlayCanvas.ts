@@ -3,7 +3,9 @@ export function syncCanvasToVideo(canvas: HTMLCanvasElement, video: HTMLVideoEle
   const height = video.clientHeight || video.videoHeight;
 
   if (width > 0 && height > 0) {
-    canvas.width = width;
-    canvas.height = height;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
   }
 }

@@ -51,6 +51,12 @@ export type ClickTracker = {
   pendingAIValidation?: boolean; // Flag to prevent duplicate AI validation calls
   pendingAIReacquisition?: boolean; // Flag to prevent duplicate re-acquisition calls
   lastGoodPosition?: { x: number; y: number }; // Last known good position for re-acquisition
+  // Detector-locked tracking fields (YOLO-backed)
+  detectorTrackId?: string;
+  detectorLabel?: string;
+  detectorConfidence?: number;
+  detectorMisses?: number;
+  lastDetectorAt?: number;
 };
 
 export type TrackingUpdate = {
@@ -83,6 +89,8 @@ export interface YoloDetection {
 
 export interface HybridTrackingOptions {
   detections?: YoloDetection[];
+  detectorEnabled?: boolean;
+  detectorDominant?: boolean;
   yoloWeight?: number; // Weight for YOLO position correction (0-1, default 0.3)
   yoloReacquireRadius?: number; // Search radius for re-acquiring lost trackers
 }
@@ -238,22 +246,46 @@ export function createTracker(options: {
 /**
  * Match a YOLO detection to a tracker by checking proximity
  */
+function getDetectionKey(detection: YoloDetection): string | null {
+  return detection.trackId ?? detection.id ?? null;
+}
+
+function shouldAdoptDetectionLabel(tracker: ClickTracker): boolean {
+  if (tracker.labelStatus === "labeled") return false;
+  return (
+    tracker.label.startsWith("Subject") ||
+    tracker.label.startsWith("Target") ||
+    tracker.label.startsWith("Region")
+  );
+}
+
+function formatDetectionLabel(detectionLabel: string, fallbackLabel: string): string {
+  const trimmed = detectionLabel.trim();
+  if (!trimmed) {
+    return fallbackLabel;
+  }
+  const suffixMatch = fallbackLabel.match(/\b(\d+)$/);
+  const suffix = suffixMatch ? ` ${suffixMatch[1]}` : "";
+  const normalized = `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
+  return `${normalized}${suffix}`;
+}
+
 function findMatchingDetection(
   tracker: ClickTracker,
   detections: YoloDetection[],
   maxDistance: number = 80
-): { detection: YoloDetection; distance: number } | null {
-  let best: { detection: YoloDetection; distance: number } | null = null;
+): { detection: YoloDetection; distance: number; index: number } | null {
+  let best: { detection: YoloDetection; distance: number; index: number } | null = null;
 
-  for (const det of detections) {
+  detections.forEach((det, index) => {
     const centerX = det.bbox.centerX;
     const centerY = det.bbox.centerY;
     const distance = Math.hypot(tracker.x - centerX, tracker.y - centerY);
 
     if (distance < maxDistance && (!best || distance < best.distance)) {
-      best = { detection: det, distance };
+      best = { detection: det, distance, index };
     }
-  }
+  });
 
   return best;
 }
@@ -278,34 +310,88 @@ export function updateTrackers(
   const detections = hybridOptions?.detections ?? [];
   const yoloWeight = hybridOptions?.yoloWeight ?? 0.35;
   const yoloReacquireRadius = hybridOptions?.yoloReacquireRadius ?? config.searchRadius * 2;
-  const hasYolo = detections.length > 0;
+  const hasDetections = detections.length > 0;
+  const detectorEnabled = hybridOptions?.detectorEnabled ?? hasDetections;
+  const detectorDominant = hybridOptions?.detectorDominant ?? false;
+  const detectorLostLimit = Math.max(3, Math.round(config.targetFps * 0.5));
 
   // Track which detections have been used
   const usedDetectionIndices = new Set<number>();
 
   const updated = trackers.map((tracker) => {
-    const result = matchTemplate(luma, width, height, tracker, config);
-    const rawConfidence = Math.max(0, Math.min(100, Math.round((1 - result.score) * 100)));
-    let confidence = Math.round(tracker.confidence * 0.7 + rawConfidence * 0.3);
+    let detectorTrackId = tracker.detectorTrackId;
+    let detectorLabel = tracker.detectorLabel;
+    let detectorConfidence = tracker.detectorConfidence;
+    let detectorMisses = tracker.detectorMisses ?? 0;
+    let lastDetectorAt = tracker.lastDetectorAt;
 
     // Find matching YOLO detection
-    const yoloMatch = hasYolo
-      ? findMatchingDetection(tracker, detections, config.searchRadius * 1.5)
-      : null;
-    if (yoloMatch) {
-      const idx = detections.indexOf(yoloMatch.detection);
-      if (idx >= 0) usedDetectionIndices.add(idx);
+    let yoloMatch: { detection: YoloDetection; distance: number; index: number } | null = null;
+    if (detectorEnabled && detectorTrackId) {
+      if (hasDetections) {
+        const index = detections.findIndex((det) => getDetectionKey(det) === detectorTrackId);
+        if (index >= 0) {
+          const detection = detections[index];
+          if (detection) {
+            const center = getYoloCenter(detection);
+            const distance = Math.hypot(tracker.x - center.x, tracker.y - center.y);
+            yoloMatch = { detection, distance, index };
+            usedDetectionIndices.add(index);
+            detectorMisses = 0;
+            detectorLabel = detection.label ?? detectorLabel;
+            detectorConfidence = detection.confidence;
+            lastDetectorAt = now;
+          }
+        } else {
+          detectorMisses += 1;
+        }
+      } else {
+        detectorMisses += 1;
+      }
     }
 
+    if (!yoloMatch && hasDetections && !detectorTrackId) {
+      const match = findMatchingDetection(tracker, detections, config.searchRadius * 1.5);
+      if (match) {
+        yoloMatch = match;
+        usedDetectionIndices.add(match.index);
+        detectorTrackId = getDetectionKey(match.detection) ?? detectorTrackId;
+        detectorLabel = match.detection.label ?? detectorLabel;
+        detectorConfidence = match.detection.confidence;
+        detectorMisses = 0;
+        lastDetectorAt = now;
+      }
+    }
+
+    const detectorLockActive = detectorEnabled && Boolean(detectorTrackId);
+    const detectorLost = detectorLockActive && !yoloMatch && detectorMisses >= detectorLostLimit;
+
+    const shouldComputeTemplate = !detectorDominant || !detectorLockActive || !yoloMatch;
+    const result = shouldComputeTemplate
+      ? matchTemplate(luma, width, height, tracker, config)
+      : { x: tracker.x, y: tracker.y, score: 0 };
+    const rawConfidence = shouldComputeTemplate
+      ? Math.max(0, Math.min(100, Math.round((1 - result.score) * 100)))
+      : Math.round((yoloMatch?.detection.confidence ?? 0) * 100);
+    let confidence = Math.round(tracker.confidence * 0.7 + rawConfidence * 0.3);
+
     let state: TrackerState = "tracking";
-    if (result.score > config.lostThreshold && !yoloMatch) {
-      // Lost according to template, but check if YOLO sees it
-      state = "lost";
-    } else if (result.score > config.lostThreshold && yoloMatch) {
-      // Template lost but YOLO found it - trust YOLO
-      state = yoloMatch.detection.confidence > 0.4 ? "tracking" : "occluded";
-    } else if (result.score > config.occludedThreshold) {
-      state = "occluded";
+    if (detectorLockActive) {
+      if (yoloMatch) {
+        state = yoloMatch.detection.confidence > 0.25 ? "tracking" : "occluded";
+      } else {
+        state = detectorLost ? "lost" : "occluded";
+      }
+    } else {
+      if (result.score > config.lostThreshold && !yoloMatch) {
+        // Lost according to template, but check if YOLO sees it
+        state = "lost";
+      } else if (result.score > config.lostThreshold && yoloMatch) {
+        // Template lost but YOLO found it - trust YOLO
+        state = yoloMatch.detection.confidence > 0.4 ? "tracking" : "occluded";
+      } else if (result.score > config.occludedThreshold) {
+        state = "occluded";
+      }
     }
 
     if (state !== tracker.state) {
@@ -317,53 +403,53 @@ export function updateTrackers(
     const predictedY = tracker.y + tracker.velocity.y;
 
     // === HYBRID POSITION CALCULATION ===
-    let targetX: number;
-    let targetY: number;
+    let targetX = result.x;
+    let targetY = result.y;
     let newLabel = tracker.label;
 
-    if (state === "lost" && !yoloMatch) {
+    if (detectorLockActive && !yoloMatch) {
+      // Detector-locked but missing detection: hold prediction to avoid drift.
+      targetX = predictedX;
+      targetY = predictedY;
+      confidence = Math.max(15, Math.round(tracker.confidence * 0.9));
+    } else if (yoloMatch && state !== "lost") {
+      // Have both template match and YOLO - blend them (or go detector-first).
+      const yoloCenter = getYoloCenter(yoloMatch.detection);
+
+      if (detectorDominant && detectorLockActive) {
+        targetX = yoloCenter.x;
+        targetY = yoloCenter.y;
+        const detectionConfidence = Math.round(yoloMatch.detection.confidence * 100);
+        confidence = Math.max(confidence, detectionConfidence);
+      } else {
+        const lockBoost = detectorLockActive ? 0.4 : 0;
+        const baseWeight = Math.min(0.9, yoloWeight + lockBoost);
+        const effectiveYoloWeight = Math.min(
+          0.9,
+          baseWeight * Math.max(0.35, yoloMatch.detection.confidence)
+        );
+        const templateWeight = 1 - effectiveYoloWeight;
+
+        targetX = result.x * templateWeight + yoloCenter.x * effectiveYoloWeight;
+        targetY = result.y * templateWeight + yoloCenter.y * effectiveYoloWeight;
+
+        // Boost confidence when both agree
+        const agreement = 1 - yoloMatch.distance / (config.searchRadius * 2);
+        const detectionConfidence = Math.round(yoloMatch.detection.confidence * 100);
+        confidence = Math.min(
+          100,
+          Math.max(confidence, detectionConfidence) + Math.round(agreement * 10)
+        );
+      }
+
+      // Update label from YOLO if generic
+      if (shouldAdoptDetectionLabel(tracker) && yoloMatch.detection.label) {
+        newLabel = formatDetectionLabel(yoloMatch.detection.label, tracker.label);
+      }
+    } else if (state === "lost") {
       // Truly lost - use velocity prediction
       targetX = predictedX;
       targetY = predictedY;
-    } else if (yoloMatch && state !== "lost") {
-      // Have both template match and YOLO - blend them
-      const yoloCenter = getYoloCenter(yoloMatch.detection);
-      const effectiveYoloWeight = yoloWeight * yoloMatch.detection.confidence;
-      const templateWeight = 1 - effectiveYoloWeight;
-
-      targetX = result.x * templateWeight + yoloCenter.x * effectiveYoloWeight;
-      targetY = result.y * templateWeight + yoloCenter.y * effectiveYoloWeight;
-
-      // Boost confidence when both agree
-      const agreement = 1 - yoloMatch.distance / (config.searchRadius * 2);
-      confidence = Math.min(
-        100,
-        confidence + Math.round(agreement * 15 * yoloMatch.detection.confidence)
-      );
-
-      // Update label from YOLO if generic
-      if (tracker.label.startsWith("Target") && yoloMatch.detection.label) {
-        newLabel = yoloMatch.detection.label;
-      }
-    } else if (yoloMatch && state === "lost") {
-      // Template lost but YOLO found - use YOLO position
-      const yoloCenter = getYoloCenter(yoloMatch.detection);
-      targetX = yoloCenter.x;
-      targetY = yoloCenter.y;
-      confidence = Math.round(yoloMatch.detection.confidence * 80);
-      state = "tracking"; // Recover from lost
-
-      if (state !== tracker.state) {
-        stateChanges.push({ id: tracker.id, from: tracker.state, to: state });
-      }
-
-      if (tracker.label.startsWith("Target") && yoloMatch.detection.label) {
-        newLabel = yoloMatch.detection.label;
-      }
-    } else {
-      // Template match only
-      targetX = result.x;
-      targetY = result.y;
     }
 
     const smoothing = state === "lost" ? 0.2 : config.smoothing;
@@ -384,7 +470,7 @@ export function updateTrackers(
         ? tracker.history
         : [...tracker.history.slice(-config.maxHistory + 1), { x: nextX, y: nextY, t: now }];
 
-    if (state === "tracking" && confidence >= config.minConfidenceForUpdate) {
+    if (state === "tracking" && confidence >= config.minConfidenceForUpdate && shouldComputeTemplate) {
       const patch = extractTemplate(
         luma,
         width,
@@ -408,13 +494,18 @@ export function updateTrackers(
       velocity,
       history,
       lostFrames,
-      label: newLabel
+      label: newLabel,
+      detectorTrackId,
+      detectorLabel,
+      detectorConfidence,
+      detectorMisses: detectorEnabled ? detectorMisses : 0,
+      lastDetectorAt
     };
   });
 
   // Check for lost trackers that can be re-acquired via unmatched YOLO detections
   const finalTrackers = updated.map((tracker) => {
-    if (tracker.state !== "lost" || !hasYolo) return tracker;
+    if (tracker.state !== "lost" || !hasDetections) return tracker;
 
     // Look for nearby unmatched YOLO detection
     for (let i = 0; i < detections.length; i++) {
@@ -431,6 +522,7 @@ export function updateTrackers(
 
         // Re-acquire tracker (we know it's "lost" from the check above)
         stateChanges.push({ id: tracker.id, from: "lost", to: "tracking" });
+        const nextDetectorTrackId = getDetectionKey(det) ?? tracker.detectorTrackId;
 
         return {
           ...tracker,
@@ -439,11 +531,18 @@ export function updateTrackers(
           state: "tracking" as TrackerState,
           confidence: Math.round(det.confidence * 75),
           lostFrames: 0,
-          label: tracker.label.startsWith("Target") ? det.label : tracker.label,
+          label: shouldAdoptDetectionLabel(tracker)
+            ? formatDetectionLabel(det.label, tracker.label)
+            : tracker.label,
           history: [
             ...tracker.history.slice(-config.maxHistory + 1),
             { x: center.x, y: center.y, t: now }
-          ]
+          ],
+          detectorTrackId: nextDetectorTrackId,
+          detectorLabel: det.label ?? tracker.detectorLabel,
+          detectorConfidence: det.confidence,
+          detectorMisses: 0,
+          lastDetectorAt: now
         };
       }
     }

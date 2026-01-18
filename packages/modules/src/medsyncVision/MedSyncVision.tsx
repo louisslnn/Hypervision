@@ -4,13 +4,20 @@ import { syncCanvasToVideo } from "@hypervision/ar-core";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  blendEmbeddings,
+  compareEmbeddings,
+  computeReIdEmbedding,
+  DEFAULT_REID_CONFIG,
+  ReIdConfig,
+  ReIdEmbedding
+} from "./reidEmbedding";
+import {
   AnchorConfig,
   AnchorSet,
   detectAnchorsOnObject,
   createAnchorSet,
   trackAnchors,
   estimatePositionFromAnchors,
-  blendPositions,
   // renderAnchors - not used since anchors are internal only
   ANCHOR_CONFIG
 } from "../shared/anchorTracking";
@@ -47,6 +54,18 @@ interface TrackerHistory {
   timestamp: number;
 }
 
+// AI-trackable object interface (used by both markers and drawings)
+interface AITrackable {
+  id: string;
+  x: number;
+  y: number;
+  label: string;
+  objectDescription?: string | undefined;
+  visualFeatures?: string | undefined;
+  referenceImage?: string | undefined;
+  lastGoodPosition?: Point | undefined;
+}
+
 interface Tracker {
   id: string;
   x: number;
@@ -73,6 +92,29 @@ interface Tracker {
   framesLost: number;
   framesOccluded: number;
   lastGoodPosition: Point;
+  reidEmbedding?: ReIdEmbedding | null;
+  lastEmbeddingUpdate?: number;
+  // Template tracking (fast motion fallback)
+  template?: Uint8Array | null;
+  templateSize?: number;
+  templateMean?: number;
+  templateStd?: number;
+  lastTemplateUpdate?: number;
+  // Visual DNA (feature-based re-identification)
+  visualKeypoints?: Point[] | null;
+  visualDescriptors?: number[] | null;
+  visualDescriptorRows?: number;
+  visualDescriptorCols?: number;
+  visualRoiCenter?: Point | null;
+  visualRoiSize?: number;
+  visualHist?: number[] | null;
+  dnaTemplate?: Uint8Array | null;
+  dnaTemplateMean?: number;
+  dnaTemplateStd?: number;
+  reidCandidate?: Point | null;
+  reidCandidateFrames?: number;
+  templateMismatchFrames?: number;
+  framesTracked?: number;
   // YOLO box memory (optional, helps matching)
   bboxWidth?: number;
   bboxHeight?: number;
@@ -85,6 +127,7 @@ interface Tracker {
   referenceImage?: string; // Base64 of original object crop for comparison
   pendingAIValidation?: boolean; // Flag to prevent duplicate AI calls
   pendingAIReacquisition?: boolean; // Flag to prevent duplicate re-acquisition calls
+  aiValidationStrikes?: number; // Consecutive AI invalidations
   // Anchor-based tracking (hybrid approach)
   anchorSet?: AnchorSet | undefined; // Set of keypoint anchors on the object
   useAnchors?: boolean | undefined; // Whether to use anchor-assisted tracking
@@ -100,6 +143,10 @@ interface DrawingStroke {
   label: string;
   visible: boolean;
   opacity: number;
+  // State machine for independent drawings (like trackers)
+  state?: TrackerState;
+  framesLost?: number;
+  confidence?: number;
   // AI Object-Aware Drawing (same as markers)
   labelStatus?: LabelStatus;
   objectDescription?: string;
@@ -107,6 +154,8 @@ interface DrawingStroke {
   referenceImage?: string;
   lastAIValidation?: number;
   aiConfidence?: number;
+  pendingAIValidation?: boolean;
+  pendingAIReacquisition?: boolean;
   // Anchor-based tracking for drawings
   anchorSet?: AnchorSet | undefined;
   useAnchors?: boolean | undefined;
@@ -115,39 +164,42 @@ interface DrawingStroke {
   centroidY?: number | undefined;
   prevCentroidX?: number | undefined;
   prevCentroidY?: number | undefined;
+  // Velocity for prediction
+  velocityX?: number;
+  velocityY?: number;
 }
 
 // Configuration - Optimized for surgical tool tracking
 const CONFIG = {
-  // Multi-scale optical flow for better tool tracking
-  SEARCH_RADIUS: 40, // Larger search for fast-moving tools
-  SAMPLE_RADIUS: 18, // Larger sample for better context
-  SAMPLE_STEP: 2,
-  MIN_FLOW_CONFIDENCE: 0.35, // Slightly more permissive
-  FORWARD_BACKWARD_THRESHOLD: 4.0, // Allow more movement
+  // Balanced optical flow - improved for multi-marker accuracy
+  SEARCH_RADIUS: 58, // Slightly increased from 55
+  SAMPLE_RADIUS: 20, // Increased from 18 for better context
+  SAMPLE_STEP: 2,    // Keep at 2 for accuracy
+  MIN_FLOW_CONFIDENCE: 0.20, // Slightly lower for faster motion
+  FORWARD_BACKWARD_THRESHOLD: 6.5, // Slightly more tolerant
 
   // Additional scales for multi-scale matching
-  MULTI_SCALE_FACTORS: [0.8, 1.0, 1.2], // Search at different scales
+  MULTI_SCALE_FACTORS: [0.85, 1.0, 1.15],
 
   // State transitions - more tolerant for surgical scenarios
-  OCCLUSION_SCORE_THRESHOLD: 4000, // Higher threshold for metallic reflections
-  LOST_SCORE_THRESHOLD: 8000,
-  OCCLUSION_TIMEOUT: 12, // More frames before declaring occluded
-  LOST_TIMEOUT: 150, // More frames before declaring lost
+  OCCLUSION_SCORE_THRESHOLD: 4500, // Slightly higher
+  LOST_SCORE_THRESHOLD: 13000,     // Slightly higher
+  OCCLUSION_TIMEOUT: 18,           // Slightly faster
+  LOST_TIMEOUT: 200,               // Faster recovery
   BOUNDARY_GUARD: 15,
 
   // Kalman filter - tuned for smooth tool tracking
-  KALMAN_PROCESS_NOISE: 0.4, // Lower = smoother
+  KALMAN_PROCESS_NOISE: 0.6, // More responsive for fast motion
   KALMAN_MEASUREMENT_NOISE: 0.15,
-  SMOOTHING_FACTOR: 0.5, // Lower = smoother tracking
+  SMOOTHING_FACTOR: 0.35, // Lower = more responsive tracking
 
   // Visual DNA - larger sample for better tool identification
-  COLOR_SAMPLE_SIZE: 40,
-  COLOR_MATCH_THRESHOLD: 0.5, // More permissive for re-ID
+  COLOR_SAMPLE_SIZE: 48,
+  COLOR_MATCH_THRESHOLD: 0.45, // More permissive for re-ID
 
   // Edge tracking for metallic surfaces
-  EDGE_WEIGHT: 0.4, // How much to weight edge matching
-  GRADIENT_SAMPLE_RADIUS: 20,
+  EDGE_WEIGHT: 0.55, // How much to weight edge matching (slightly higher for tools)
+  GRADIENT_SAMPLE_RADIUS: 24,
 
   // Rendering
   TRAIL_LENGTH: 80,
@@ -156,11 +208,65 @@ const CONFIG = {
   MARKER_SIZE_GAMING: 14
 };
 
-const PROCESSING_CONFIG = {
-  MAX_WIDTH: 960,
-  MAX_HEIGHT: 540,
-  TARGET_FPS: 30
+const TEMPLATE_CONFIG = {
+  SIZE: 25,
+  MIN_NCC: 0.5,
+  UPDATE_INTERVAL_MS: 350,
+  UPDATE_CONFIDENCE: 0.7,
+  UPDATE_ALPHA: 0.25,
+  COARSE_STEP: 3,
+  REFINE_RADIUS: 8
 };
+
+const GLOBAL_MOTION_CONFIG = {
+  GRID_X: 4,        // Balanced from 5/3
+  GRID_Y: 3,        // Restored from 2
+  PATCH_SIZE: 15,   // Restored from 13
+  SEARCH_RADIUS: 16, // Balanced from 18/14
+  STEP: 2,          // Restored from 3
+  MIN_CONFIDENCE: 0.35
+};
+
+const FUSION_CONFIG = {
+  MIN_CONFIDENCE: 0.3,
+  GATING_FACTOR: 1.0
+};
+
+const SOURCE_WEIGHTS = {
+  flow: 1,
+  yolo: 0.9,
+  template: 0.95,
+  anchor: 1.05,
+  orb: 1.1
+} as const;
+
+const ANCHOR_PRECISION_OVERRIDES: Partial<AnchorConfig> = {
+  MAX_ANCHORS: 10,          // Balanced from 12/8
+  MIN_ANCHORS: 4,           // Restored from 3
+  DETECTION_RADIUS: 110,    // Balanced from 120/100
+  EDGE_THRESHOLD: 24,
+  CORNER_THRESHOLD: 0.015,
+  MIN_ANCHOR_SPACING: 10,   // Restored from 12
+  ANCHOR_SEARCH_RADIUS: 35, // Balanced from 40/28
+  MIN_ANCHOR_CONFIDENCE: 0.35,
+  TEMPLATE_UPDATE_CONFIDENCE: 0.7,
+  TEMPLATE_UPDATE_ALPHA: 0.2
+};
+
+const PROCESSING_PRESETS = {
+  balanced: {
+    MAX_WIDTH: 960,
+    MAX_HEIGHT: 540,
+    TARGET_FPS: 30
+  },
+  precision: {
+    MAX_WIDTH: 1920,
+    MAX_HEIGHT: 1080,
+    TARGET_FPS: 22
+  }
+} as const;
+
+const REID_UPDATE_INTERVAL_MS = 1200;
 
 const COLORS = [
   "#10b981",
@@ -174,32 +280,32 @@ const COLORS = [
 ];
 const STYLE_NAMES: AnnotationStyle[] = ["minimal", "standard", "detailed", "gaming"];
 
-// AI Object-Aware Tracking Configuration - Optimized for surgical precision
+// AI Object-Aware Tracking Configuration - More aggressive for better re-acquisition
 const AI_CONFIG = {
   // Auto-identification on marker placement
   AUTO_IDENTIFY_ON_PLACEMENT: true,
 
   // Validation triggers - more frequent for better accuracy
-  VALIDATION_CONFIDENCE_THRESHOLD: 0.5, // Validate when confidence drops below this (raised)
-  VALIDATION_COOLDOWN_MS: 1200, // Faster validation checks (1.2s instead of 2s)
+  VALIDATION_CONFIDENCE_THRESHOLD: 0.4, // Validate when confidence drops below this
+  VALIDATION_COOLDOWN_MS: 1200, // Faster validation checks (was 2000)
   VALIDATION_ON_OCCLUSION: true, // Validate when tracker becomes occluded
   
   // IMPORTANT: Periodic validation even with anchors
   // Anchors can boost confidence but don't verify we're on the RIGHT object
-  PERIODIC_VALIDATION_MS: 3000, // Run AI validation every 3 seconds regardless of confidence
+  PERIODIC_VALIDATION_MS: 3500, // Run AI validation every 3.5 seconds (was 5s)
   VALIDATE_WITH_ANCHORS: true, // Still validate even when anchors provide good tracking
 
-  // Re-acquisition settings - more aggressive search
-  REACQUISITION_START_FRAME: 6, // Start AI search earlier (was 10)
-  REACQUISITION_INTERVAL_FRAMES: 15, // More frequent search (was 30)
-  REACQUISITION_MIN_CONFIDENCE: 0.45, // Accept slightly lower confidence (was 0.5)
+  // Re-acquisition settings - much more aggressive search
+  REACQUISITION_START_FRAME: 3, // Start AI search very early (was 6)
+  REACQUISITION_INTERVAL_FRAMES: 8, // Much more frequent search (was 15)
+  REACQUISITION_MIN_CONFIDENCE: 0.38, // Accept lower confidence for faster recovery (was 0.45)
 
   // Crop sizes for AI analysis
   IDENTIFICATION_CROP_SIZE: 300, // Larger crop for initial identification
   VALIDATION_CROP_SIZE: 200, // Smaller crop for validation checks
 
   // API settings
-  MAX_CONCURRENT_AI_CALLS: 3 // Allow more concurrent calls (was 2)
+  MAX_CONCURRENT_AI_CALLS: 4 // Allow more concurrent calls (was 3)
 };
 
 // OpenAI model selection with safe fallback
@@ -210,6 +316,14 @@ type ProcessingScale = {
   x: number;
   y: number;
   scalar: number;
+};
+
+type TrackingQuality = keyof typeof PROCESSING_PRESETS;
+
+type ProcessingConfig = {
+  MAX_WIDTH: number;
+  MAX_HEIGHT: number;
+  TARGET_FPS: number;
 };
 
 type FlowConfig = {
@@ -224,15 +338,62 @@ type FlowConfig = {
   LOST_SCORE_THRESHOLD: number;
 };
 
+type GlobalMotion = {
+  dx: number;
+  dy: number;
+  confidence: number;
+};
+
+type GlobalMotionConfig = {
+  GRID_X: number;
+  GRID_Y: number;
+  PATCH_SIZE: number;
+  SEARCH_RADIUS: number;
+  STEP: number;
+  MIN_CONFIDENCE: number;
+};
+
+type MotionPrediction = {
+  x: number;
+  y: number;
+  velocityScale: number;
+  globalDx: number;
+  globalDy: number;
+};
+
+type TrackingCandidateSource = keyof typeof SOURCE_WEIGHTS;
+
+type TrackingCandidate = {
+  x: number;
+  y: number;
+  confidence: number;
+  source: TrackingCandidateSource;
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function ensureOdd(value: number): number {
+  return value % 2 === 0 ? value + 1 : value;
+}
+
+function median(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? 0;
+}
+
 function getProcessingDimensions(
   displayWidth: number,
-  displayHeight: number
+  displayHeight: number,
+  config: ProcessingConfig
 ): { width: number; height: number; scale: ProcessingScale } {
-  const scale = Math.min(
-    1,
-    PROCESSING_CONFIG.MAX_WIDTH / displayWidth,
-    PROCESSING_CONFIG.MAX_HEIGHT / displayHeight
-  );
+  const scale = Math.min(1, config.MAX_WIDTH / displayWidth, config.MAX_HEIGHT / displayHeight);
   const width = Math.max(1, Math.round(displayWidth * scale));
   const height = Math.max(1, Math.round(displayHeight * scale));
   return {
@@ -246,38 +407,61 @@ function getProcessingDimensions(
   };
 }
 
-function getScaledFlowConfig(scale: number): FlowConfig {
+function getScaledFlowConfig(scale: number, lightweight: boolean = false): FlowConfig {
   const radiusScale = Math.max(0.35, Math.min(1, scale));
+  
+  // Optimize for lightweight mode without sacrificing too much accuracy
+  const lightweightFactor = lightweight ? 0.8 : 1;  // Only 20% reduction
+  
   return {
-    SEARCH_RADIUS: Math.max(6, Math.round(CONFIG.SEARCH_RADIUS * radiusScale)),
-    SAMPLE_RADIUS: Math.max(4, Math.round(CONFIG.SAMPLE_RADIUS * radiusScale)),
-    SAMPLE_STEP: Math.max(1, Math.round(CONFIG.SAMPLE_STEP * radiusScale)),
-    MIN_FLOW_CONFIDENCE: CONFIG.MIN_FLOW_CONFIDENCE,
+    SEARCH_RADIUS: Math.max(8, Math.round(CONFIG.SEARCH_RADIUS * radiusScale * lightweightFactor)),
+    SAMPLE_RADIUS: Math.max(6, Math.round(CONFIG.SAMPLE_RADIUS * radiusScale * lightweightFactor)),
+    SAMPLE_STEP: Math.max(2, Math.round(CONFIG.SAMPLE_STEP * radiusScale * (lightweight ? 1.3 : 1))),
+    MIN_FLOW_CONFIDENCE: CONFIG.MIN_FLOW_CONFIDENCE * (lightweight ? 0.9 : 1),
     FORWARD_BACKWARD_THRESHOLD: Math.max(1, CONFIG.FORWARD_BACKWARD_THRESHOLD * radiusScale),
     BOUNDARY_GUARD: Math.max(4, Math.round(CONFIG.BOUNDARY_GUARD * radiusScale)),
-    GRADIENT_SAMPLE_RADIUS: Math.max(4, Math.round(CONFIG.GRADIENT_SAMPLE_RADIUS * radiusScale)),
+    GRADIENT_SAMPLE_RADIUS: Math.max(6, Math.round(CONFIG.GRADIENT_SAMPLE_RADIUS * radiusScale * lightweightFactor)),
     EDGE_WEIGHT: CONFIG.EDGE_WEIGHT,
     LOST_SCORE_THRESHOLD: CONFIG.LOST_SCORE_THRESHOLD
   };
 }
 
-function getScaledAnchorConfig(scale: number): AnchorConfig {
+function getScaledAnchorConfig(
+  scale: number,
+  overrides?: Partial<AnchorConfig>
+): AnchorConfig {
+  const baseConfig = { ...ANCHOR_CONFIG, ...(overrides ?? {}) };
   const radiusScale = Math.max(0.35, Math.min(1, scale));
   const templateSize = Math.max(
     7,
-    Math.round(ANCHOR_CONFIG.ANCHOR_TEMPLATE_SIZE * radiusScale)
+    Math.round(baseConfig.ANCHOR_TEMPLATE_SIZE * radiusScale)
   );
   const oddTemplateSize = templateSize % 2 === 0 ? templateSize + 1 : templateSize;
 
   return {
-    ...ANCHOR_CONFIG,
-    DETECTION_RADIUS: Math.max(20, Math.round(ANCHOR_CONFIG.DETECTION_RADIUS * radiusScale)),
-    MIN_ANCHOR_SPACING: Math.max(8, Math.round(ANCHOR_CONFIG.MIN_ANCHOR_SPACING * radiusScale)),
+    ...baseConfig,
+    DETECTION_RADIUS: Math.max(20, Math.round(baseConfig.DETECTION_RADIUS * radiusScale)),
+    MIN_ANCHOR_SPACING: Math.max(8, Math.round(baseConfig.MIN_ANCHOR_SPACING * radiusScale)),
     ANCHOR_TEMPLATE_SIZE: oddTemplateSize,
     ANCHOR_SEARCH_RADIUS: Math.max(
       10,
-      Math.round(ANCHOR_CONFIG.ANCHOR_SEARCH_RADIUS * radiusScale)
+      Math.round(baseConfig.ANCHOR_SEARCH_RADIUS * radiusScale)
     )
+  };
+}
+
+function getScaledGlobalMotionConfig(scale: number): GlobalMotionConfig {
+  const radiusScale = Math.max(0.5, Math.min(1, scale));
+  return {
+    GRID_X: GLOBAL_MOTION_CONFIG.GRID_X,
+    GRID_Y: GLOBAL_MOTION_CONFIG.GRID_Y,
+    PATCH_SIZE: ensureOdd(Math.max(9, Math.round(GLOBAL_MOTION_CONFIG.PATCH_SIZE * radiusScale))),
+    SEARCH_RADIUS: Math.max(
+      6,
+      Math.round(GLOBAL_MOTION_CONFIG.SEARCH_RADIUS * radiusScale)
+    ),
+    STEP: Math.max(2, Math.round(GLOBAL_MOTION_CONFIG.STEP * radiusScale)),
+    MIN_CONFIDENCE: GLOBAL_MOTION_CONFIG.MIN_CONFIDENCE
   };
 }
 
@@ -639,7 +823,393 @@ function compareGradients(grad1: Float32Array, grad2: Float32Array): number {
 }
 
 // ============================================================================
-// OPTICAL FLOW ENGINE - Enhanced with Edge Detection for Tool Tracking
+// TEMPLATE TRACKING (FAST MOTION FALLBACK)
+// ============================================================================
+
+function captureTemplate(
+  frame: ImageData,
+  centerX: number,
+  centerY: number,
+  size: number
+): Uint8Array | null {
+  const half = Math.floor(size / 2);
+  if (
+    centerX < half ||
+    centerX >= frame.width - half ||
+    centerY < half ||
+    centerY >= frame.height - half
+  ) {
+    return null;
+  }
+
+  const template = new Uint8Array(size * size);
+  const data = frame.data;
+  let idx = 0;
+
+  for (let y = -half; y <= half; y++) {
+    for (let x = -half; x <= half; x++) {
+      const px = Math.round(centerX + x);
+      const py = Math.round(centerY + y);
+      const offset = (py * frame.width + px) * 4;
+      const r = data[offset] ?? 0;
+      const g = data[offset + 1] ?? 0;
+      const b = data[offset + 2] ?? 0;
+      template[idx++] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+    }
+  }
+
+  return template;
+}
+
+function computeTemplateStats(template: Uint8Array): { mean: number; std: number } {
+  if (!template.length) return { mean: 0, std: 0 };
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < template.length; i++) {
+    const v = template[i] ?? 0;
+    sum += v;
+    sumSq += v * v;
+  }
+  const mean = sum / template.length;
+  const variance = Math.max(0, sumSq / template.length - mean * mean);
+  return { mean, std: Math.sqrt(variance) };
+}
+
+function computeNccAt(
+  frame: ImageData,
+  centerX: number,
+  centerY: number,
+  size: number,
+  template: Uint8Array,
+  templateStats: { mean: number; std: number }
+): number | null {
+  const half = Math.floor(size / 2);
+  if (
+    centerX < half ||
+    centerX >= frame.width - half ||
+    centerY < half ||
+    centerY >= frame.height - half
+  ) {
+    return null;
+  }
+
+  const data = frame.data;
+  const frameWidth = frame.width;
+  const count = size * size;
+  let sum = 0;
+  let sumSq = 0;
+
+  // First pass: compute mean and variance of frame patch
+  const baseY = centerY - half;
+  const baseX = centerX - half;
+  
+  for (let y = 0; y < size; y++) {
+    const rowOffset = (baseY + y) * frameWidth + baseX;
+    for (let x = 0; x < size; x++) {
+      const offset = (rowOffset + x) * 4;
+      const r = data[offset] ?? 0;
+      const g = data[offset + 1] ?? 0;
+      const b = data[offset + 2] ?? 0;
+      const v = 0.299 * r + 0.587 * g + 0.114 * b;
+      sum += v;
+      sumSq += v * v;
+    }
+  }
+
+  const mean = sum / count;
+  const variance = Math.max(0, sumSq / count - mean * mean);
+  const std = Math.sqrt(variance);
+  if (std < 1e-3 || templateStats.std < 1e-3) return null;
+
+  // Second pass: compute correlation
+  let dot = 0;
+  let idx = 0;
+  for (let y = 0; y < size; y++) {
+    const rowOffset = (baseY + y) * frameWidth + baseX;
+    for (let x = 0; x < size; x++) {
+      const offset = (rowOffset + x) * 4;
+      const r = data[offset] ?? 0;
+      const g = data[offset + 1] ?? 0;
+      const b = data[offset + 2] ?? 0;
+      const v = 0.299 * r + 0.587 * g + 0.114 * b;
+      dot += (v - mean) * ((template[idx++] ?? 0) - templateStats.mean);
+    }
+  }
+
+  return dot / (count * std * templateStats.std);
+}
+
+function matchTemplate(
+  frame: ImageData,
+  template: Uint8Array,
+  templateStats: { mean: number; std: number },
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  searchRadius: number,
+  step: number,
+  minScore: number
+): { x: number; y: number; score: number; confidence: number } | null {
+  const size = Math.round(Math.sqrt(template.length));
+  if (!size) return null;
+  const half = Math.floor(size / 2);
+  const boundedRadius = Math.max(2, Math.round(searchRadius));
+  const stride = Math.max(1, Math.round(step));
+
+  let bestScore = -Infinity;
+  let bestX = centerX;
+  let bestY = centerY;
+
+  const startX = Math.max(half, Math.round(centerX - boundedRadius));
+  const endX = Math.min(width - half - 1, Math.round(centerX + boundedRadius));
+  const startY = Math.max(half, Math.round(centerY - boundedRadius));
+  const endY = Math.min(height - half - 1, Math.round(centerY + boundedRadius));
+
+  // Coarse search
+  for (let y = startY; y <= endY; y += stride) {
+    for (let x = startX; x <= endX; x += stride) {
+      const ncc = computeNccAt(frame, x, y, size, template, templateStats);
+      if (ncc === null) continue;
+      if (ncc > bestScore) {
+        bestScore = ncc;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  if (bestScore < minScore) return null;
+
+  // Refinement if stride > 1
+  if (stride > 1) {
+    const refineRadius = Math.min(TEMPLATE_CONFIG.REFINE_RADIUS, stride + 1);
+    for (let y = bestY - refineRadius; y <= bestY + refineRadius; y++) {
+      for (let x = bestX - refineRadius; x <= bestX + refineRadius; x++) {
+        if (
+          x < half ||
+          x >= width - half ||
+          y < half ||
+          y >= height - half
+        ) {
+          continue;
+        }
+        const ncc = computeNccAt(frame, x, y, size, template, templateStats);
+        if (ncc === null) continue;
+        if (ncc > bestScore) {
+          bestScore = ncc;
+          bestX = x;
+          bestY = y;
+        }
+      }
+    }
+  }
+
+  const confidence = clamp((bestScore + 1) / 2, 0, 1);
+  return { x: bestX, y: bestY, score: bestScore, confidence };
+}
+
+function blendTemplate(
+  existing: Uint8Array,
+  update: Uint8Array,
+  alpha: number
+): Uint8Array {
+  const blended = new Uint8Array(existing.length);
+  const mix = clamp(alpha, 0, 1);
+  for (let i = 0; i < existing.length; i++) {
+    blended[i] = Math.round(existing[i] * (1 - mix) + (update[i] ?? 0) * mix);
+  }
+  return blended;
+}
+
+function getMotionPrediction(
+  tracker: Tracker,
+  globalMotion?: GlobalMotion | null
+): MotionPrediction {
+  const velocity = Math.sqrt(
+    tracker.velocityX * tracker.velocityX + tracker.velocityY * tracker.velocityY
+  );
+  const velocityScale = Math.min(2.2, 1 + velocity * 0.12);
+  const globalConfidence = globalMotion?.confidence ?? 0;
+  const globalScale = clamp(globalConfidence * 1.2, 0, 1);
+  const globalDx = (globalMotion?.dx ?? 0) * globalScale;
+  const globalDy = (globalMotion?.dy ?? 0) * globalScale;
+
+  return {
+    x: tracker.x + tracker.velocityX * velocityScale + globalDx,
+    y: tracker.y + tracker.velocityY * velocityScale + globalDy,
+    velocityScale,
+    globalDx,
+    globalDy
+  };
+}
+
+function getAdaptiveFlowConfig(
+  base: FlowConfig,
+  tracker: Tracker,
+  globalMotion?: GlobalMotion | null
+): FlowConfig {
+  const speed = Math.hypot(tracker.velocityX, tracker.velocityY);
+  const globalMagnitude = globalMotion ? Math.hypot(globalMotion.dx, globalMotion.dy) : 0;
+  const motionBoost = clamp(1 + speed * 0.08 + globalMagnitude * 0.03, 1, 2.4);
+  const occlusionBoost = tracker.framesOccluded > 0 ? 1 + Math.min(1, tracker.framesOccluded / 6) * 0.5 : 1;
+  const searchRadius = Math.max(6, Math.round(base.SEARCH_RADIUS * motionBoost * occlusionBoost));
+  const sampleRadius = Math.max(4, Math.round(base.SAMPLE_RADIUS * clamp(1 + speed * 0.03, 1, 1.6)));
+  const minConfidence = base.MIN_FLOW_CONFIDENCE * (tracker.framesOccluded > 0 ? 0.9 : 1);
+
+  return {
+    ...base,
+    SEARCH_RADIUS: searchRadius,
+    SAMPLE_RADIUS: sampleRadius,
+    MIN_FLOW_CONFIDENCE: minConfidence,
+    FORWARD_BACKWARD_THRESHOLD: Math.max(
+      1,
+      base.FORWARD_BACKWARD_THRESHOLD * clamp(motionBoost, 1, 2)
+    ),
+    GRADIENT_SAMPLE_RADIUS: Math.max(
+      4,
+      Math.round(base.GRADIENT_SAMPLE_RADIUS * clamp(1 + speed * 0.05, 1, 1.8))
+    ),
+    LOST_SCORE_THRESHOLD: Math.round(base.LOST_SCORE_THRESHOLD * motionBoost)
+  };
+}
+
+function estimateGlobalMotion(
+  prevFrame: ImageData,
+  currFrame: ImageData,
+  width: number,
+  height: number,
+  config: GlobalMotionConfig
+): GlobalMotion | null {
+  const half = Math.floor(config.PATCH_SIZE / 2);
+  const dxs: number[] = [];
+  const dys: number[] = [];
+  const confidences: number[] = [];
+  const gridX = Math.max(1, config.GRID_X);
+  const gridY = Math.max(1, config.GRID_Y);
+  const minScore = Math.max(0.35, TEMPLATE_CONFIG.MIN_NCC - 0.15);
+
+  // Use larger step for faster global motion
+  const searchStep = Math.max(2, config.STEP);
+
+  for (let gy = 0; gy < gridY; gy++) {
+    for (let gx = 0; gx < gridX; gx++) {
+      const cx = Math.round(((gx + 0.5) * width) / gridX);
+      const cy = Math.round(((gy + 0.5) * height) / gridY);
+
+      if (
+        cx < half + config.SEARCH_RADIUS ||
+        cx >= width - half - config.SEARCH_RADIUS ||
+        cy < half + config.SEARCH_RADIUS ||
+        cy >= height - half - config.SEARCH_RADIUS
+      ) {
+        continue;
+      }
+
+      const template = captureTemplate(prevFrame, cx, cy, config.PATCH_SIZE);
+      if (!template) continue;
+      const stats = computeTemplateStats(template);
+      if (stats.std < 1e-3) continue;
+
+      const match = matchTemplate(
+        currFrame,
+        template,
+        stats,
+        cx,
+        cy,
+        width,
+        height,
+        config.SEARCH_RADIUS,
+        searchStep,
+        minScore
+      );
+
+      if (match && match.confidence >= config.MIN_CONFIDENCE) {
+        dxs.push(match.x - cx);
+        dys.push(match.y - cy);
+        confidences.push(match.confidence);
+      }
+    }
+  }
+
+  if (dxs.length < 3) return null;
+  const dx = median(dxs);
+  const dy = median(dys);
+  const avgConfidence =
+    confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
+  const density = confidences.length / (gridX * gridY);
+
+  return {
+    dx,
+    dy,
+    confidence: clamp(avgConfidence * density, 0, 1)
+  };
+}
+
+function offsetAnchorSet(anchorSet: AnchorSet, dx: number, dy: number): AnchorSet {
+  return {
+    ...anchorSet,
+    centroidX: anchorSet.centroidX + dx,
+    centroidY: anchorSet.centroidY + dy,
+    anchors: anchorSet.anchors.map((anchor) => ({
+      ...anchor,
+      x: anchor.x + dx,
+      y: anchor.y + dy,
+      prevX: anchor.prevX + dx,
+      prevY: anchor.prevY + dy
+    }))
+  };
+}
+
+function fuseTrackingCandidates(
+  candidates: TrackingCandidate[],
+  gatingDistance: number
+): { x: number; y: number; confidence: number } | null {
+  if (!candidates.length) return null;
+
+  const weights = candidates.map((candidate) => ({
+    candidate,
+    weight: candidate.confidence * (SOURCE_WEIGHTS[candidate.source] ?? 1)
+  }));
+  const totalWeight = weights.reduce((sum, entry) => sum + entry.weight, 0);
+
+  const best = weights.reduce((prev, curr) => (curr.weight > prev.weight ? curr : prev));
+  if (totalWeight <= 0) {
+    return { x: best.candidate.x, y: best.candidate.y, confidence: best.candidate.confidence };
+  }
+
+  const meanX = weights.reduce((sum, entry) => sum + entry.candidate.x * entry.weight, 0) / totalWeight;
+  const meanY = weights.reduce((sum, entry) => sum + entry.candidate.y * entry.weight, 0) / totalWeight;
+  const gate = Math.max(6, gatingDistance);
+
+  const filtered = weights.filter((entry) => {
+    const dist = Math.hypot(entry.candidate.x - meanX, entry.candidate.y - meanY);
+    return dist <= gate || weights.length === 1;
+  });
+
+  if (!filtered.length) {
+    return { x: best.candidate.x, y: best.candidate.y, confidence: best.candidate.confidence };
+  }
+
+  const filteredWeight = filtered.reduce((sum, entry) => sum + entry.weight, 0);
+  const fusedX =
+    filtered.reduce((sum, entry) => sum + entry.candidate.x * entry.weight, 0) / filteredWeight;
+  const fusedY =
+    filtered.reduce((sum, entry) => sum + entry.candidate.y * entry.weight, 0) / filteredWeight;
+  const avgDist =
+    filtered.reduce((sum, entry) => sum + Math.hypot(entry.candidate.x - fusedX, entry.candidate.y - fusedY), 0) /
+    filtered.length;
+  const agreement = 1 - clamp(avgDist / gate, 0, 1);
+  const weightedConfidence =
+    filtered.reduce((sum, entry) => sum + entry.candidate.confidence * (SOURCE_WEIGHTS[entry.candidate.source] ?? 1), 0) /
+    filtered.length;
+  const confidence = clamp(weightedConfidence * 0.7 + agreement * 0.3, 0, 1);
+
+  return { x: fusedX, y: fusedY, confidence };
+}
+
+// ============================================================================
+// OPTICAL FLOW ENGINE - Balanced Performance & Accuracy
 // ============================================================================
 
 function computeOpticalFlow(
@@ -648,23 +1218,24 @@ function computeOpticalFlow(
   tracker: Tracker,
   width: number,
   height: number,
-  flowConfig: FlowConfig = getScaledFlowConfig(1)
+  flowConfig: FlowConfig = getScaledFlowConfig(1),
+  globalMotion?: GlobalMotion | null
 ): { x: number; y: number; confidence: number; valid: boolean; atBoundary: boolean } {
   const cfg = flowConfig;
 
-  // Predict position based on velocity (with momentum for fast-moving tools)
+  // Predict position based on velocity
+  const prediction = getMotionPrediction(tracker, globalMotion);
   const velocity = Math.sqrt(
     tracker.velocityX * tracker.velocityX + tracker.velocityY * tracker.velocityY
   );
-  const velocityScale = Math.min(2.0, 1.0 + velocity * 0.1);
-  const predictedX = tracker.x + tracker.velocityX * velocityScale;
-  const predictedY = tracker.y + tracker.velocityY * velocityScale;
+  const velocityScale = prediction.velocityScale;
+  const predictedX = prediction.x;
+  const predictedY = prediction.y;
 
-  // Use predicted position as starting point
   const startX = predictedX;
   const startY = predictedY;
 
-  // Boundary check with margin for sample radius
+  // Boundary check
   const margin = cfg.BOUNDARY_GUARD + cfg.SAMPLE_RADIUS;
   const atBoundary =
     startX < margin || startX > width - margin || startY < margin || startY > height - margin;
@@ -675,54 +1246,72 @@ function computeOpticalFlow(
 
   const prevData = prevFrame.data;
   const currData = currFrame.data;
+  const dataLen = prevData.length;
+  
+  // Pre-compute tracker position once
+  const trackerXInt = Math.round(tracker.x);
+  const trackerYInt = Math.round(tracker.y);
+  
+  // Pre-compute expected motion for velocity consistency
+  const expectedDx = tracker.velocityX * velocityScale + prediction.globalDx;
+  const expectedDy = tracker.velocityY * velocityScale + prediction.globalDy;
 
   // Compute reference gradient for edge matching (important for metallic tools)
   const refGradient = computeGradientMagnitude(
     prevFrame,
-    Math.round(tracker.x),
-    Math.round(tracker.y),
+    trackerXInt,
+    trackerYInt,
     width,
     height,
     cfg.GRADIENT_SAMPLE_RADIUS
   );
 
-  // === COARSE SEARCH with adaptive radius ===
+  // === COARSE SEARCH - Color + Distance (FAST) ===
   let bestX = startX;
   let bestY = startY;
   let bestScore = Infinity;
+  // Keep more candidates for better gradient selection
+  const topCandidates: Array<{x: number; y: number; score: number}> = [];
+  const MAX_CANDIDATES = 8;
 
-  // Adaptive search radius based on velocity
-  const adaptiveRadius = Math.min(cfg.SEARCH_RADIUS * 1.5, cfg.SEARCH_RADIUS + velocity * 2);
+  const globalMagnitude = Math.hypot(prediction.globalDx, prediction.globalDy);
+  const adaptiveRadius = Math.min(
+    cfg.SEARCH_RADIUS * 1.8,
+    cfg.SEARCH_RADIUS + velocity * 2 + globalMagnitude * 1.5
+  );
+  
+  // Coarse search with step of 3
+  const coarseStep = 3;
+  const sampleStep = cfg.SAMPLE_STEP;
+  const sampleRadius = cfg.SAMPLE_RADIUS;
 
-  for (let dy = -adaptiveRadius; dy <= adaptiveRadius; dy += 3) {
-    for (let dx = -adaptiveRadius; dx <= adaptiveRadius; dx += 3) {
+  for (let dy = -adaptiveRadius; dy <= adaptiveRadius; dy += coarseStep) {
+    for (let dx = -adaptiveRadius; dx <= adaptiveRadius; dx += coarseStep) {
       const testX = Math.round(startX + dx);
       const testY = Math.round(startY + dy);
 
       if (
-        testX < cfg.SAMPLE_RADIUS ||
-        testX >= width - cfg.SAMPLE_RADIUS ||
-        testY < cfg.SAMPLE_RADIUS ||
-        testY >= height - cfg.SAMPLE_RADIUS
+        testX < sampleRadius ||
+        testX >= width - sampleRadius ||
+        testY < sampleRadius ||
+        testY >= height - sampleRadius
       ) {
         continue;
       }
 
+      // Color matching
       let colorScore = 0;
       let samples = 0;
 
-      // Color/intensity matching
-      for (let py = -cfg.SAMPLE_RADIUS; py <= cfg.SAMPLE_RADIUS; py += cfg.SAMPLE_STEP) {
-        for (let px = -cfg.SAMPLE_RADIUS; px <= cfg.SAMPLE_RADIUS; px += cfg.SAMPLE_STEP) {
-          const prevIdx = ((Math.round(tracker.y) + py) * width + (Math.round(tracker.x) + px)) * 4;
-          const currIdx = ((testY + py) * width + (testX + px)) * 4;
+      for (let py = -sampleRadius; py <= sampleRadius; py += sampleStep) {
+        const prevRowBase = (trackerYInt + py) * width;
+        const currRowBase = (testY + py) * width;
+        
+        for (let px = -sampleRadius; px <= sampleRadius; px += sampleStep) {
+          const prevIdx = (prevRowBase + trackerXInt + px) * 4;
+          const currIdx = (currRowBase + testX + px) * 4;
 
-          if (
-            prevIdx >= 0 &&
-            prevIdx < prevData.length - 3 &&
-            currIdx >= 0 &&
-            currIdx < currData.length - 3
-          ) {
+          if (prevIdx >= 0 && prevIdx < dataLen - 3 && currIdx >= 0 && currIdx < dataLen - 3) {
             const dr = (prevData[prevIdx] ?? 0) - (currData[currIdx] ?? 0);
             const dg = (prevData[prevIdx + 1] ?? 0) - (currData[currIdx + 1] ?? 0);
             const db = (prevData[prevIdx + 2] ?? 0) - (currData[currIdx + 2] ?? 0);
@@ -735,31 +1324,23 @@ function computeOpticalFlow(
       if (samples === 0) continue;
       colorScore /= samples;
 
-      // Edge matching for metallic surfaces (surgical tools have strong edges)
-      const testGradient = computeGradientMagnitude(
-        currFrame,
-        testX,
-        testY,
-        width,
-        height,
-        cfg.GRADIENT_SAMPLE_RADIUS
-      );
-      const edgeScore = compareGradients(refGradient, testGradient) * 1000;
-
-      // Combined score: color + edge
-      const combinedScore = colorScore * (1 - cfg.EDGE_WEIGHT) + edgeScore * cfg.EDGE_WEIGHT;
-
-      // Distance penalty for motion smoothness
+      // Distance penalty - slightly stronger for smoothness
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const distPenalty = dist * 0.3;
+      const distPenalty = dist * 0.15;
+      
+      // Velocity consistency - stronger weight for better motion prediction
+      const velocityError = Math.sqrt((dx - expectedDx) * (dx - expectedDx) + (dy - expectedDy) * (dy - expectedDy));
+      const velocityPenalty = velocityError * 0.08;
 
-      // Velocity consistency bonus (reward positions consistent with motion)
-      const expectedDx = tracker.velocityX * velocityScale;
-      const expectedDy = tracker.velocityY * velocityScale;
-      const velocityError = Math.sqrt((dx - expectedDx) ** 2 + (dy - expectedDy) ** 2);
-      const velocityPenalty = velocityError * 0.1;
+      const totalScore = colorScore + distPenalty + velocityPenalty;
 
-      const totalScore = combinedScore + distPenalty + velocityPenalty;
+      // Keep top candidates for gradient refinement
+      const lastCandidate = topCandidates[topCandidates.length - 1];
+      if (topCandidates.length < MAX_CANDIDATES || (lastCandidate && totalScore < lastCandidate.score)) {
+        topCandidates.push({x: testX, y: testY, score: totalScore});
+        topCandidates.sort((a, b) => a.score - b.score);
+        if (topCandidates.length > MAX_CANDIDATES) topCandidates.pop();
+      }
 
       if (totalScore < bestScore) {
         bestScore = totalScore;
@@ -769,19 +1350,55 @@ function computeOpticalFlow(
     }
   }
 
-  // === FINE REFINEMENT around best match ===
+  // === GRADIENT REFINEMENT on top candidates ===
+  // Apply edge matching only to best candidates (not all positions)
+  let gradientBestX = bestX;
+  let gradientBestY = bestY;
+  let gradientBestScore = bestScore;
+  
+  for (const candidate of topCandidates) {
+    const testGradient = computeGradientMagnitude(
+      currFrame,
+      candidate.x,
+      candidate.y,
+      width,
+      height,
+      cfg.GRADIENT_SAMPLE_RADIUS
+    );
+    const edgeScore = compareGradients(refGradient, testGradient) * 600;
+    
+    // Combined score with stronger edge weight for tools
+    const combinedScore = candidate.score * (1 - cfg.EDGE_WEIGHT * 1.2) + edgeScore * cfg.EDGE_WEIGHT * 1.2;
+    
+    if (combinedScore < gradientBestScore) {
+      gradientBestScore = combinedScore;
+      gradientBestX = candidate.x;
+      gradientBestY = candidate.y;
+    }
+  }
+  
+  // Use gradient result if it's significantly better
+  if (gradientBestScore < bestScore * 1.1) {
+    bestX = gradientBestX;
+    bestY = gradientBestY;
+    bestScore = gradientBestScore;
+  }
+
+  // === FINE REFINEMENT - Pixel-level precision ===
+  const refineRadius = 4;
   const refineX = bestX;
   const refineY = bestY;
-  for (let dy = -4; dy <= 4; dy++) {
-    for (let dx = -4; dx <= 4; dx++) {
-      const testX = Math.round(refineX + dx);
-      const testY = Math.round(refineY + dy);
+  
+  for (let dy = -refineRadius; dy <= refineRadius; dy++) {
+    for (let dx = -refineRadius; dx <= refineRadius; dx++) {
+      const testX = refineX + dx;
+      const testY = refineY + dy;
 
       if (
-        testX < cfg.SAMPLE_RADIUS ||
-        testX >= width - cfg.SAMPLE_RADIUS ||
-        testY < cfg.SAMPLE_RADIUS ||
-        testY >= height - cfg.SAMPLE_RADIUS
+        testX < sampleRadius ||
+        testX >= width - sampleRadius ||
+        testY < sampleRadius ||
+        testY >= height - sampleRadius
       ) {
         continue;
       }
@@ -789,17 +1406,16 @@ function computeOpticalFlow(
       let score = 0;
       let samples = 0;
 
-      for (let py = -cfg.SAMPLE_RADIUS; py <= cfg.SAMPLE_RADIUS; py += 2) {
-        for (let px = -cfg.SAMPLE_RADIUS; px <= cfg.SAMPLE_RADIUS; px += 2) {
-          const prevIdx = ((Math.round(tracker.y) + py) * width + (Math.round(tracker.x) + px)) * 4;
-          const currIdx = ((testY + py) * width + (testX + px)) * 4;
+      // Denser sampling in refinement
+      for (let py = -sampleRadius; py <= sampleRadius; py += 2) {
+        const prevRowBase = (trackerYInt + py) * width;
+        const currRowBase = (testY + py) * width;
+        
+        for (let px = -sampleRadius; px <= sampleRadius; px += 2) {
+          const prevIdx = (prevRowBase + trackerXInt + px) * 4;
+          const currIdx = (currRowBase + testX + px) * 4;
 
-          if (
-            prevIdx >= 0 &&
-            prevIdx < prevData.length - 3 &&
-            currIdx >= 0 &&
-            currIdx < currData.length - 3
-          ) {
+          if (prevIdx >= 0 && prevIdx < dataLen - 3 && currIdx >= 0 && currIdx < dataLen - 3) {
             const dr = (prevData[prevIdx] ?? 0) - (currData[currIdx] ?? 0);
             const dg = (prevData[prevIdx + 1] ?? 0) - (currData[currIdx + 1] ?? 0);
             const db = (prevData[prevIdx + 2] ?? 0) - (currData[currIdx + 2] ?? 0);
@@ -820,22 +1436,82 @@ function computeOpticalFlow(
     }
   }
 
-  // === BACKWARD FLOW VALIDATION ===
-  let backX = bestX;
-  let backY = bestY;
-  let backScore = Infinity;
+  // === SUB-PIXEL REFINEMENT (Parabolic Interpolation) ===
+  // Sample scores at neighbors to find sub-pixel optimum
+  const getScoreAt = (px: number, py: number): number => {
+    if (px < sampleRadius || px >= width - sampleRadius || 
+        py < sampleRadius || py >= height - sampleRadius) {
+      return Infinity;
+    }
+    let score = 0;
+    let samples = 0;
+    for (let y = -sampleRadius; y <= sampleRadius; y += 2) {
+      const prevRowBase = (trackerYInt + y) * width;
+      const currRowBase = (py + y) * width;
+      for (let x = -sampleRadius; x <= sampleRadius; x += 2) {
+        const prevIdx = (prevRowBase + trackerXInt + x) * 4;
+        const currIdx = (currRowBase + px + x) * 4;
+        if (prevIdx >= 0 && prevIdx < dataLen - 3 && currIdx >= 0 && currIdx < dataLen - 3) {
+          const dr = (prevData[prevIdx] ?? 0) - (currData[currIdx] ?? 0);
+          const dg = (prevData[prevIdx + 1] ?? 0) - (currData[currIdx + 1] ?? 0);
+          const db = (prevData[prevIdx + 2] ?? 0) - (currData[currIdx + 2] ?? 0);
+          score += dr * dr + dg * dg + db * db;
+          samples++;
+        }
+      }
+    }
+    return samples > 0 ? score / samples : Infinity;
+  };
+  
+  // Get scores for parabolic fit
+  const bestXInt = Math.round(bestX);
+  const bestYInt = Math.round(bestY);
+  const sL = getScoreAt(bestXInt - 1, bestYInt);
+  const sR = getScoreAt(bestXInt + 1, bestYInt);
+  const sT = getScoreAt(bestXInt, bestYInt - 1);
+  const sB = getScoreAt(bestXInt, bestYInt + 1);
+  const sC = bestScore;
+  
+  // Parabolic interpolation for sub-pixel X
+  let subX = bestXInt;
+  if (sL < Infinity && sR < Infinity && sL + sR > 2 * sC) {
+    const denom = 2 * (sL + sR - 2 * sC);
+    if (Math.abs(denom) > 1e-6) {
+      subX = bestXInt + (sL - sR) / denom;
+    }
+  }
+  
+  // Parabolic interpolation for sub-pixel Y
+  let subY = bestYInt;
+  if (sT < Infinity && sB < Infinity && sT + sB > 2 * sC) {
+    const denom = 2 * (sT + sB - 2 * sC);
+    if (Math.abs(denom) > 1e-6) {
+      subY = bestYInt + (sT - sB) / denom;
+    }
+  }
+  
+  // Clamp sub-pixel adjustment to reasonable range
+  const finalX = Math.max(bestXInt - 0.5, Math.min(bestXInt + 0.5, subX));
+  const finalY = Math.max(bestYInt - 0.5, Math.min(bestYInt + 0.5, subY));
 
+  // === BACKWARD FLOW VALIDATION ===
+  let backX = bestXInt;
+  let backY = bestYInt;
+  let backBestScore = Infinity;
+  
   const backRadius = cfg.SEARCH_RADIUS / 2;
-  for (let dy = -backRadius; dy <= backRadius; dy += 2) {
-    for (let dx = -backRadius; dx <= backRadius; dx += 2) {
-      const testX = Math.round(bestX + dx);
-      const testY = Math.round(bestY + dy);
+  const backStep = 2;
+
+  for (let dy = -backRadius; dy <= backRadius; dy += backStep) {
+    for (let dx = -backRadius; dx <= backRadius; dx += backStep) {
+      const testX = Math.round(bestXInt + dx);
+      const testY = Math.round(bestYInt + dy);
 
       if (
-        testX < cfg.SAMPLE_RADIUS ||
-        testX >= width - cfg.SAMPLE_RADIUS ||
-        testY < cfg.SAMPLE_RADIUS ||
-        testY >= height - cfg.SAMPLE_RADIUS
+        testX < sampleRadius ||
+        testX >= width - sampleRadius ||
+        testY < sampleRadius ||
+        testY >= height - sampleRadius
       ) {
         continue;
       }
@@ -843,17 +1519,15 @@ function computeOpticalFlow(
       let score = 0;
       let samples = 0;
 
-      for (let py = -cfg.SAMPLE_RADIUS; py <= cfg.SAMPLE_RADIUS; py += cfg.SAMPLE_STEP) {
-        for (let px = -cfg.SAMPLE_RADIUS; px <= cfg.SAMPLE_RADIUS; px += cfg.SAMPLE_STEP) {
-          const currIdx = ((Math.round(bestY) + py) * width + (Math.round(bestX) + px)) * 4;
-          const prevIdx = ((testY + py) * width + (testX + px)) * 4;
+      for (let py = -sampleRadius; py <= sampleRadius; py += sampleStep) {
+        const currRowBase = (bestYInt + py) * width;
+        const prevRowBase = (testY + py) * width;
+        
+        for (let px = -sampleRadius; px <= sampleRadius; px += sampleStep) {
+          const currIdx = (currRowBase + bestXInt + px) * 4;
+          const prevIdx = (prevRowBase + testX + px) * 4;
 
-          if (
-            currIdx >= 0 &&
-            currIdx < currData.length - 3 &&
-            prevIdx >= 0 &&
-            prevIdx < prevData.length - 3
-          ) {
+          if (currIdx >= 0 && currIdx < dataLen - 3 && prevIdx >= 0 && prevIdx < dataLen - 3) {
             const dr = (currData[currIdx] ?? 0) - (prevData[prevIdx] ?? 0);
             const dg = (currData[currIdx + 1] ?? 0) - (prevData[prevIdx + 1] ?? 0);
             const db = (currData[currIdx + 2] ?? 0) - (prevData[prevIdx + 2] ?? 0);
@@ -865,8 +1539,8 @@ function computeOpticalFlow(
 
       if (samples > 0) {
         score /= samples;
-        if (score < backScore) {
-          backScore = score;
+        if (score < backBestScore) {
+          backBestScore = score;
           backX = testX;
           backY = testY;
         }
@@ -874,22 +1548,16 @@ function computeOpticalFlow(
     }
   }
 
-  // === FORWARD-BACKWARD ERROR CHECK ===
-  const fbError = Math.sqrt(
-    (backX - tracker.x) * (backX - tracker.x) + (backY - tracker.y) * (backY - tracker.y)
-  );
-
+  const fbError = Math.sqrt((backX - tracker.x) * (backX - tracker.x) + (backY - tracker.y) * (backY - tracker.y));
   const passesFb = fbError < cfg.FORWARD_BACKWARD_THRESHOLD;
-  const confidence = passesFb ? Math.max(0, 1 - bestScore / cfg.LOST_SCORE_THRESHOLD) : 0;
+  
+  // Improved confidence: combine match quality with motion consistency
+  const motionConsistency = 1 - Math.min(1, fbError / cfg.FORWARD_BACKWARD_THRESHOLD);
+  const matchQuality = Math.max(0, 1 - bestScore / cfg.LOST_SCORE_THRESHOLD);
+  const confidence = passesFb ? matchQuality * 0.7 + motionConsistency * 0.3 : 0;
   const valid = passesFb && confidence >= cfg.MIN_FLOW_CONFIDENCE;
 
-  return {
-    x: bestX,
-    y: bestY,
-    confidence,
-    valid,
-    atBoundary: false
-  };
+  return { x: finalX, y: finalY, confidence, valid, atBoundary: false };
 }
 
 // ============================================================================
@@ -933,6 +1601,10 @@ function searchForTracker(
     sampleRadius?: number;
     boundaryGuard?: number;
     roi?: { x: number; y: number; width: number; height: number };
+    embedding?: ReIdEmbedding | null;
+    embeddingConfig?: ReIdConfig;
+    maxCandidates?: number;
+    embeddingThreshold?: number;
   }
 ): Point | null {
   if (!tracker.colorSignature) return null;
@@ -959,6 +1631,8 @@ function searchForTracker(
   );
   let bestMatch: Point | null = null;
   let bestSimilarity = 0;
+  const candidates: Array<{ x: number; y: number; similarity: number }> = [];
+  const maxCandidates = options?.maxCandidates ?? DEFAULT_REID_CONFIG.maxCandidates;
 
   for (let y = startY; y < endY; y += gridStep) {
     for (let x = startX; x < endX; x += gridStep) {
@@ -968,6 +1642,10 @@ function searchForTracker(
       if (similarity > CONFIG.COLOR_MATCH_THRESHOLD && similarity > bestSimilarity) {
         bestSimilarity = similarity;
         bestMatch = { x, y };
+      }
+
+      if (similarity > CONFIG.COLOR_MATCH_THRESHOLD && options?.embedding) {
+        candidates.push({ x, y, similarity });
       }
     }
   }
@@ -999,6 +1677,35 @@ function searchForTracker(
           bestMatch = { x: rx, y: ry };
         }
       }
+    }
+  }
+
+  if (options?.embedding && candidates.length > 0) {
+    candidates.sort((a, b) => b.similarity - a.similarity);
+    const shortlist = candidates.slice(0, maxCandidates);
+    let bestEmbeddingMatch: Point | null = null;
+    let bestEmbeddingScore = 0;
+    const embeddingThreshold =
+      options.embeddingThreshold ?? options.embeddingConfig?.matchThreshold ?? DEFAULT_REID_CONFIG.matchThreshold;
+
+    for (const candidate of shortlist) {
+      const embedding = computeReIdEmbedding(
+        frame,
+        candidate.x,
+        candidate.y,
+        width,
+        height,
+        options.embeddingConfig
+      );
+      const score = compareEmbeddings(options.embedding, embedding);
+      if (score > bestEmbeddingScore) {
+        bestEmbeddingScore = score;
+        bestEmbeddingMatch = { x: candidate.x, y: candidate.y };
+      }
+    }
+
+    if (bestEmbeddingMatch && bestEmbeddingScore >= embeddingThreshold) {
+      return bestEmbeddingMatch;
     }
   }
 
@@ -1206,7 +1913,7 @@ Focus on features that distinguish this object from similar items in the scene.`
  */
 async function validateTrackedObject(
   canvas: HTMLCanvasElement,
-  tracker: Tracker,
+  tracker: AITrackable,
   apiKey: string
 ): Promise<ValidationResult> {
   if (!tracker.objectDescription && !tracker.visualFeatures) {
@@ -1316,7 +2023,7 @@ isValid should be TRUE if:
  */
 async function findObjectInFrame(
   canvas: HTMLCanvasElement,
-  tracker: Tracker,
+  tracker: AITrackable,
   apiKey: string
 ): Promise<ReacquisitionResult | null> {
   if (!tracker.label || tracker.label.startsWith("Region")) {
@@ -1343,7 +2050,7 @@ Image dimensions: ${canvas.width}x${canvas.height} pixels.
 Object to find: "${tracker.label}"
 ${tracker.objectDescription ? `Description: ${tracker.objectDescription}` : ""}
 ${tracker.visualFeatures ? `Visual features: ${tracker.visualFeatures}` : ""}
-Last known position: approximately (${Math.round(tracker.lastGoodPosition.x)}, ${Math.round(tracker.lastGoodPosition.y)})
+Last known position: approximately (${Math.round(tracker.lastGoodPosition?.x ?? tracker.x)}, ${Math.round(tracker.lastGoodPosition?.y ?? tracker.y)})
 
 Respond ONLY in JSON format (no markdown):
 {"found":true/false,"x":number,"y":number,"confidence":0.0-1.0}
@@ -1477,6 +2184,13 @@ const styles = {
   fpsDisplay: {
     fontFamily: "'JetBrains Mono', monospace",
     fontSize: "0.75rem"
+  } as React.CSSProperties,
+  statusBadge: {
+    fontSize: "0.7rem",
+    padding: "4px 8px",
+    borderRadius: "6px",
+    border: "1px solid rgba(255, 255, 255, 0.1)",
+    background: "rgba(255, 255, 255, 0.08)"
   } as React.CSSProperties,
   apiInput: {
     background: "rgba(255, 255, 255, 0.05)",
@@ -1659,6 +2373,15 @@ const styles = {
     padding: "0 4px",
     transition: "color 0.2s"
   } as React.CSSProperties,
+  statusWarning: {
+    marginTop: "10px",
+    padding: "8px 12px",
+    background: "rgba(239, 68, 68, 0.12)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: "8px",
+    fontSize: "0.75rem",
+    color: "#fecaca"
+  } as React.CSSProperties,
   aiBtn: {
     background: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)",
     border: "none",
@@ -1737,12 +2460,35 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const processingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const processingScaleRef = useRef<ProcessingScale>({ x: 1, y: 1, scalar: 1 });
+  const processingConfigRef = useRef<ProcessingConfig>(PROCESSING_PRESETS.precision);
   const flowConfigRef = useRef<FlowConfig>(getScaledFlowConfig(1));
   const anchorConfigRef = useRef<AnchorConfig>(ANCHOR_CONFIG);
+  const globalMotionConfigRef = useRef<GlobalMotionConfig>(getScaledGlobalMotionConfig(1));
+  const globalMotionRef = useRef<GlobalMotion | null>(null);
   const colorSampleRadiusRef = useRef(CONFIG.COLOR_SAMPLE_SIZE);
+  const reidConfigRef = useRef<ReIdConfig>(DEFAULT_REID_CONFIG);
   const lastProcessTimeRef = useRef(0);
   const aiValidationGuardRef = useRef<Set<string>>(new Set());
   const aiReacqGuardRef = useRef<Set<string>>(new Set());
+  const workerRef = useRef<Worker | null>(null);
+  const workerReadyRef = useRef(false);
+  const workerBusyRef = useRef(false);
+  const workerFrameIdRef = useRef(0);
+  const workerSessionRef = useRef(0);
+  const captureInFlightRef = useRef(false);
+  const editVersionRef = useRef(0);
+  
+  // Main thread tracking optimization refs
+  const mainThreadTrackingBusyRef = useRef(false);
+  const mainThreadFrameCounterRef = useRef(0);
+  const mainThreadSkipIntervalRef = useRef(2); // Run tracking every N frames
+  
+  const [workerEnabled, setWorkerEnabled] = useState(false);
+  const [openCvReady, setOpenCvReady] = useState<boolean | null>(null);
+  const [openCvError, setOpenCvError] = useState<string | null>(null);
+  const [workerStatus, setWorkerStatus] = useState<"off" | "starting" | "on" | "error">("off");
+  const [workerError, setWorkerError] = useState<string | null>(null);
+  const workerStartTimeoutRef = useRef<number | null>(null);
 
   const [videoLoaded, setVideoLoaded] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1752,8 +2498,10 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
   const [currentDrawing, setCurrentDrawing] = useState<DrawingStroke | null>(null);
   const [drawMode, setDrawMode] = useState(false);
   const [annotationStyle, setAnnotationStyle] = useState<AnnotationStyle>("standard");
+  const [trackingQuality, setTrackingQuality] = useState<TrackingQuality>("precision");
   const [selectedTracker, setSelectedTracker] = useState<string | null>(null);
   const [fps, setFps] = useState(0);
+  const [processingFps, setProcessingFps] = useState(0);
   const [showHelp, setShowHelp] = useState(false);
 
   // Server-based detection state
@@ -1763,10 +2511,16 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
   // Anchor-based tracking state
   // Anchors are used internally for position accuracy but NOT rendered to user
-  const [useAnchorTracking, setUseAnchorTracking] = useState(false); // Disabled by default for simplicity
+  const [useAnchorTracking, setUseAnchorTracking] = useState(true);
+
+  // Tracking mode preference: prefer main thread over worker
+  const [preferMainThread, setPreferMainThread] = useState(false);
 
   // Use API key from props
   const openaiKey = openaiApiKey ?? "";
+
+  const effectiveQuality: TrackingQuality = workerEnabled ? trackingQuality : "balanced";
+  const isPrecisionQuality = effectiveQuality === "precision";
 
   // Server detection client
   const serverUrl = detectionServerUrl ?? DETECTION_SERVER_URL;
@@ -1779,8 +2533,8 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
     serverUrl,
     mode: detectionMode,
     enabled: useServerDetection && isPlaying,
-    targetFps: 12,
-    confidenceThreshold: 0.35
+    targetFps: isPrecisionQuality ? 10 : 12,
+    confidenceThreshold: isPrecisionQuality ? 0.25 : 0.35
   });
 
   const toggleServerDetection = useCallback(() => {
@@ -1810,6 +2564,8 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
   const prevFrameRef = useRef<ImageData | null>(null);
   const frameCountRef = useRef(0);
   const lastFpsUpdateRef = useRef(Date.now());
+  const processingFrameCountRef = useRef(0);
+  const lastProcessingFpsUpdateRef = useRef(Date.now());
 
   useEffect(() => {
     trackersRef.current = trackers;
@@ -1818,6 +2574,165 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
   useEffect(() => {
     drawingsRef.current = drawings;
   }, [drawings]);
+
+  const initWorker = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (!("Worker" in window)) {
+      setWorkerEnabled(false);
+      setOpenCvReady(false);
+      setOpenCvError(null);
+      setWorkerStatus("error");
+      setWorkerError("Web Workers not supported");
+      return;
+    }
+    if (!("OffscreenCanvas" in window)) {
+      setWorkerEnabled(false);
+      setOpenCvReady(false);
+      setOpenCvError(null);
+      setWorkerStatus("error");
+      setWorkerError("OffscreenCanvas not supported");
+      return;
+    }
+
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+
+    workerReadyRef.current = false;
+    workerBusyRef.current = false;
+    workerFrameIdRef.current = 0;
+    workerSessionRef.current += 1;
+    setWorkerEnabled(false);
+    setOpenCvReady(null);
+    setOpenCvError(null);
+    setWorkerStatus("starting");
+    setWorkerError(null);
+
+    let worker: Worker | null = null;
+    try {
+      worker = new Worker(new URL("./medsyncWorker.ts", import.meta.url), { type: "classic" });
+    } catch (err) {
+      console.error("[MedSync] Failed to create worker:", err);
+      setWorkerEnabled(false);
+      setOpenCvReady(false);
+      setOpenCvError(null);
+      setWorkerStatus("error");
+      setWorkerError("Worker failed to initialize");
+      return;
+    }
+
+    workerRef.current = worker;
+
+    if (workerStartTimeoutRef.current) {
+      window.clearTimeout(workerStartTimeoutRef.current);
+    }
+    workerStartTimeoutRef.current = window.setTimeout(() => {
+      if (!workerReadyRef.current) {
+        setWorkerStatus("error");
+        setWorkerError("Worker start timed out");
+      }
+    }, 2500);
+
+    worker.onmessage = (event) => {
+      const message = event.data as
+        | { type: "ready"; openCvReady?: boolean }
+        | { type: "opencv"; openCvReady: boolean; error?: string }
+        | {
+            type: "result";
+            frameId: number;
+            sessionId: number;
+            editVersion: number;
+            trackers: Tracker[];
+            drawings: DrawingStroke[];
+          };
+
+      if (message.type === "ready") {
+        workerReadyRef.current = true;
+        setWorkerEnabled(true);
+        setOpenCvReady(message.openCvReady ?? null);
+        setOpenCvError(null);
+        setWorkerStatus("on");
+        setWorkerError(null);
+        if (workerStartTimeoutRef.current) {
+          window.clearTimeout(workerStartTimeoutRef.current);
+          workerStartTimeoutRef.current = null;
+        }
+        return;
+      }
+
+      if (message.type === "opencv") {
+        setOpenCvReady(message.openCvReady);
+        setOpenCvError(message.error ?? null);
+        if (message.openCvReady) {
+          console.log("[MedSync] ✅ OpenCV loaded successfully in worker");
+        } else {
+          console.warn("[MedSync] ❌ OpenCV failed to load:", message.error);
+        }
+        return;
+      }
+
+      if (message.type === "result") {
+        if (message.sessionId !== workerSessionRef.current) {
+          workerBusyRef.current = false;
+          return;
+        }
+        if (message.editVersion !== editVersionRef.current) {
+          workerBusyRef.current = false;
+          return;
+        }
+        if (message.frameId < workerFrameIdRef.current) {
+          workerBusyRef.current = false;
+          return;
+        }
+        workerBusyRef.current = false;
+        setTrackers(message.trackers);
+        setDrawings(message.drawings);
+      }
+    };
+
+    worker.onerror = (error) => {
+      console.error("[MedSync] Worker error:", error);
+      workerReadyRef.current = false;
+      workerBusyRef.current = false;
+      setWorkerEnabled(false);
+      setOpenCvReady(false);
+      setWorkerStatus("error");
+      setWorkerError(error?.message ?? "Worker error");
+    };
+
+    worker.onmessageerror = (error) => {
+      console.error("[MedSync] Worker message error:", error);
+      workerReadyRef.current = false;
+      workerBusyRef.current = false;
+      setWorkerEnabled(false);
+      setOpenCvReady(false);
+      setWorkerStatus("error");
+      setWorkerError("Worker message error");
+    };
+
+    worker.postMessage({ type: "init", openCvEnabled: true });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    initWorker();
+
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+      workerReadyRef.current = false;
+      workerBusyRef.current = false;
+      setWorkerEnabled(false);
+      setOpenCvReady(null);
+      setWorkerStatus("off");
+      setWorkerError(null);
+      if (workerStartTimeoutRef.current) {
+        window.clearTimeout(workerStartTimeoutRef.current);
+        workerStartTimeoutRef.current = null;
+      }
+    };
+  }, [initWorker]);
 
   const handleFileSelect = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -1835,6 +2750,11 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
     aiValidationGuardRef.current.clear();
     aiReacqGuardRef.current.clear();
     lastProcessTimeRef.current = 0;
+    workerSessionRef.current += 1;
+    workerFrameIdRef.current = 0;
+    workerBusyRef.current = false;
+    editVersionRef.current += 1;
+    workerRef.current?.postMessage({ type: "reset", sessionId: workerSessionRef.current });
   }, []);
 
   const handleVideoLoaded = useCallback(() => {
@@ -1850,10 +2770,17 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
       const id = `tracker-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const color = COLORS[trackers.length % COLORS.length] ?? COLORS[0];
       const trackerNumber = trackers.length + 1;
+      editVersionRef.current += 1;
 
       // Capture color signature for re-identification
       let colorSignature: number[] | null = null;
+      let reidEmbedding: ReIdEmbedding | null = null;
       let anchorSet: AnchorSet | undefined = undefined;
+      let template: Uint8Array | null = null;
+      let templateStats: { mean: number; std: number } | null = null;
+      const templateSize = ensureOdd(
+        Math.max(9, Math.round(flowConfigRef.current.SAMPLE_RADIUS * 1.4))
+      );
 
       if (ctx && processingCanvasRef.current) {
         const imageData = ctx.getImageData(
@@ -1869,6 +2796,18 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
           processingCanvasRef.current.width,
           colorSampleRadiusRef.current
         );
+        reidEmbedding = computeReIdEmbedding(
+          imageData,
+          x,
+          y,
+          processingCanvasRef.current.width,
+          processingCanvasRef.current.height,
+          reidConfigRef.current
+        );
+        template = captureTemplate(imageData, x, y, templateSize);
+        if (template) {
+          templateStats = computeTemplateStats(template);
+        }
 
         // HYBRID APPROACH: Detect anchor keypoints ON the object
         try {
@@ -1917,6 +2856,18 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
         framesLost: 0,
         framesOccluded: 0,
         lastGoodPosition: { x, y },
+        reidEmbedding,
+        lastEmbeddingUpdate: Date.now(),
+        template,
+        templateSize,
+        templateMean: templateStats?.mean,
+        templateStd: templateStats?.std,
+        lastTemplateUpdate: Date.now(),
+        aiValidationStrikes: 0,
+        reidCandidate: null,
+        reidCandidateFrames: 0,
+        templateMismatchFrames: 0,
+        framesTracked: 0,
         // Anchor-based tracking
         anchorSet,
         useAnchors:
@@ -1987,6 +2938,7 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
   const removeTracker = useCallback(
     (id: string) => {
+      editVersionRef.current += 1;
       setTrackers((prev) => prev.filter((t) => t.id !== id));
       setDrawings((prev) => prev.filter((d) => d.trackerId !== id));
       if (selectedTracker === id) {
@@ -2157,7 +3109,17 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
       // Initialize AI fields
       stroke.labelStatus = "idle";
+      
+      // Initialize state machine for independent drawings
+      if (!stroke.trackerId) {
+        stroke.state = "tracking";
+        stroke.framesLost = 0;
+        stroke.confidence = 1.0;
+        stroke.velocityX = 0;
+        stroke.velocityY = 0;
+      }
 
+      editVersionRef.current += 1;
       setDrawings((prev) => [...prev, stroke]);
 
       // AI IDENTIFICATION: Auto-identify what the drawing is marking
@@ -2294,6 +3256,11 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
     aiValidationGuardRef.current.clear();
     aiReacqGuardRef.current.clear();
     lastProcessTimeRef.current = 0;
+    workerSessionRef.current += 1;
+    workerFrameIdRef.current = 0;
+    workerBusyRef.current = false;
+    editVersionRef.current += 1;
+    workerRef.current?.postMessage({ type: "reset", sessionId: workerSessionRef.current });
   }, []);
 
   const cycleStyle = useCallback(() => {
@@ -2381,6 +3348,23 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
       const flowConfig = flowConfigRef.current;
       const anchorConfig = anchorConfigRef.current;
       const colorSampleRadius = colorSampleRadiusRef.current;
+      const reidConfig = reidConfigRef.current;
+      const globalMotionConfig = globalMotionConfigRef.current;
+      
+      // Cache global motion - compute every 2nd frame for balance
+      const frameCount = processingFrameCountRef.current;
+      let globalMotion: GlobalMotion | null = globalMotionRef.current;
+      if (frameCount % 2 === 0 || !globalMotion) {
+        globalMotion = estimateGlobalMotion(
+          prevFrame,
+          currentFrame,
+          width,
+          height,
+          globalMotionConfig
+        );
+        globalMotionRef.current = globalMotion;
+      }
+      const frameGlobalMotion = globalMotion ?? { dx: 0, dy: 0, confidence: 0 };
 
       // Get YOLO detections for hybrid tracking
       const yoloDetections = interpolatedDetections;
@@ -2430,8 +3414,17 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
           // === STATE MACHINE ===
           if (tracker.state === "tracking" || tracker.state === "occluded") {
-            // Run optical flow
-            const flow = computeOpticalFlow(prevFrame, currentFrame, tracker, width, height, flowConfig);
+            const adaptiveFlowConfig = getAdaptiveFlowConfig(flowConfig, tracker, frameGlobalMotion);
+            const prediction = getMotionPrediction(tracker, frameGlobalMotion);
+            const flow = computeOpticalFlow(
+              prevFrame,
+              currentFrame,
+              tracker,
+              width,
+              height,
+              adaptiveFlowConfig,
+              frameGlobalMotion
+            );
 
             // Boundary hit → instant LOST
             if (flow.atBoundary) {
@@ -2443,14 +3436,11 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               };
             }
 
-            // === HYBRID TRACKING: Combine optical flow with YOLO ===
-            let finalX = flow.x;
-            let finalY = flow.y;
-            let finalConfidence = flow.confidence;
             let newLabel = tracker.label;
             let bboxWidth = tracker.bboxWidth;
             let bboxHeight = tracker.bboxHeight;
             let bboxConfidence = tracker.bboxConfidence;
+            let yoloCandidate: TrackingCandidate | null = null;
 
             if (yoloMatch) {
               // We have a YOLO detection matching this tracker!
@@ -2459,28 +3449,12 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               const yoloBoxWidth = yoloMatch.detection.bbox.width * width;
               const yoloBoxHeight = yoloMatch.detection.bbox.height * height;
 
-              // Determine blend weight based on:
-              // - YOLO confidence
-              // - Optical flow validity
-              // - IoU quality
-              const yoloWeight = Math.min(0.5, yoloConfidence * 0.6 + yoloMatch.iou * 0.3);
-              const flowWeight = flow.valid ? 1 - yoloWeight : 0;
-              const totalWeight = yoloWeight + flowWeight;
-
-              if (totalWeight > 0) {
-                // Weighted average of YOLO and optical flow positions
-                finalX = (yoloCenter.x * yoloWeight + flow.x * flowWeight) / totalWeight;
-                finalY = (yoloCenter.y * yoloWeight + flow.y * flowWeight) / totalWeight;
-
-                // Boost confidence when YOLO agrees with optical flow
-                const agreement = Math.exp(
-                  -Math.hypot(yoloCenter.x - flow.x, yoloCenter.y - flow.y) / 50
-                );
-                finalConfidence = Math.min(
-                  1.0,
-                  flow.confidence * 0.5 + yoloConfidence * 0.3 + agreement * 0.2
-                );
-              }
+              yoloCandidate = {
+                x: yoloCenter.x,
+                y: yoloCenter.y,
+                confidence: yoloConfidence,
+                source: "yolo"
+              };
 
               // Update label from YOLO if tracker has generic label
               if (tracker.label.startsWith("Region") && yoloMatch.detection.label) {
@@ -2493,12 +3467,108 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               bboxConfidence = yoloConfidence;
             }
 
-            if (!flow.valid && !yoloMatch) {
-              // No optical flow AND no YOLO match → likely occluded
+            const templateCandidate =
+              tracker.template && tracker.templateStd && tracker.templateMean
+                ? matchTemplate(
+                    currentFrame,
+                    tracker.template,
+                    { mean: tracker.templateMean, std: tracker.templateStd },
+                    prediction.x,
+                    prediction.y,
+                    width,
+                    height,
+                    adaptiveFlowConfig.SEARCH_RADIUS * 1.4,
+                    TEMPLATE_CONFIG.COARSE_STEP,
+                    TEMPLATE_CONFIG.MIN_NCC
+                  )
+                : null;
+
+            // === HYBRID APPROACH: Anchor-based tracking ===
+            let updatedAnchorSet = tracker.anchorSet;
+            let anchorCandidate: TrackingCandidate | null = null;
+
+            if (useAnchorTracking && tracker.useAnchors && tracker.anchorSet && prevFrame) {
+              const speed = Math.hypot(tracker.velocityX, tracker.velocityY);
+              const motionBoost = clamp(
+                1 + speed * 0.05 + Math.hypot(frameGlobalMotion.dx, frameGlobalMotion.dy) * 0.03,
+                1,
+                2
+              );
+              const anchorSearchRadius = Math.max(
+                6,
+                Math.round(anchorConfig.ANCHOR_SEARCH_RADIUS * motionBoost)
+              );
+              const anchorInput =
+                frameGlobalMotion.confidence > 0.2
+                  ? offsetAnchorSet(tracker.anchorSet, frameGlobalMotion.dx, frameGlobalMotion.dy)
+                  : tracker.anchorSet;
+
+              // Track all anchors with optical flow
+              updatedAnchorSet = trackAnchors(
+                anchorInput,
+                prevFrame,
+                currentFrame,
+                { ...anchorConfig, ANCHOR_SEARCH_RADIUS: anchorSearchRadius }
+              );
+
+              // Get consensus position from anchors
+              const anchorPosition = estimatePositionFromAnchors(
+                updatedAnchorSet,
+                prediction.x,
+                prediction.y,
+                anchorConfig
+              );
+
+              if (anchorPosition.useAnchors) {
+                anchorCandidate = {
+                  x: anchorPosition.x,
+                  y: anchorPosition.y,
+                  confidence: anchorPosition.confidence,
+                  source: "anchor"
+                };
+
+                // Log anchor coherence for debugging
+                if (updatedAnchorSet.coherenceScore < anchorConfig.MIN_COHERENCE) {
+                  console.info(
+                    `[Anchors] Low coherence (${updatedAnchorSet.coherenceScore.toFixed(2)}), ${updatedAnchorSet.survivingCount}/${updatedAnchorSet.anchors.length} anchors surviving`
+                  );
+                }
+              }
+            }
+
+            const candidates: TrackingCandidate[] = [];
+            if (flow.valid) {
+              candidates.push({
+                x: flow.x,
+                y: flow.y,
+                confidence: flow.confidence,
+                source: "flow"
+              });
+            }
+            if (yoloCandidate) {
+              candidates.push(yoloCandidate);
+            }
+            if (templateCandidate) {
+              candidates.push({
+                x: templateCandidate.x,
+                y: templateCandidate.y,
+                confidence: templateCandidate.confidence,
+                source: "template"
+              });
+            }
+            if (anchorCandidate) {
+              candidates.push(anchorCandidate);
+            }
+
+            const fused = fuseTrackingCandidates(
+              candidates,
+              adaptiveFlowConfig.SEARCH_RADIUS * FUSION_CONFIG.GATING_FACTOR
+            );
+
+            if (!fused || fused.confidence < FUSION_CONFIG.MIN_CONFIDENCE) {
               const newFramesOccluded = tracker.framesOccluded + 1;
 
               if (newFramesOccluded > CONFIG.OCCLUSION_TIMEOUT) {
-                // Too long occluded → LOST
                 return {
                   ...tracker,
                   state: "lost" as TrackerState,
@@ -2512,69 +3582,80 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
                 ...tracker,
                 state: "occluded" as TrackerState,
                 framesOccluded: newFramesOccluded,
-                confidence: flow.confidence
+                confidence: fused?.confidence ?? 0
               };
             }
 
-            // If only YOLO (no valid optical flow), use YOLO position
-            if (!flow.valid && yoloMatch) {
-              const yoloCenter = getDetectionCenter(yoloMatch.detection, width, height);
-              finalX = yoloCenter.x;
-              finalY = yoloCenter.y;
-              finalConfidence = yoloMatch.detection.confidence * 0.9;
-            }
-
-            // === HYBRID APPROACH: Anchor-based tracking ===
-            let updatedAnchorSet = tracker.anchorSet;
-
-            if (useAnchorTracking && tracker.useAnchors && tracker.anchorSet && prevFrame) {
-              // Track all anchors with optical flow
-              updatedAnchorSet = trackAnchors(
-                tracker.anchorSet,
-                prevFrame,
-                currentFrame,
-                anchorConfig
-              );
-
-              // Get consensus position from anchors
-              const anchorPosition = estimatePositionFromAnchors(
-                updatedAnchorSet,
-                finalX,
-                finalY,
-                anchorConfig
-              );
-
-              // Blend anchor position with optical flow + YOLO position
-              if (anchorPosition.useAnchors) {
-                const blended = blendPositions(
-                  anchorPosition,
-                  { x: finalX, y: finalY, confidence: finalConfidence },
-                  0.5 // 50% weight to anchors
-                );
-
-                finalX = blended.x;
-                finalY = blended.y;
-
-                // Boost confidence if anchors agree
-                if (anchorPosition.confidence > 0.6) {
-                  finalConfidence = Math.max(finalConfidence, blended.confidence);
-                }
-
-                // Log anchor coherence for debugging
-                if (updatedAnchorSet.coherenceScore < anchorConfig.MIN_COHERENCE) {
-                  console.info(
-                    `[Anchors] Low coherence (${updatedAnchorSet.coherenceScore.toFixed(2)}), ${updatedAnchorSet.survivingCount}/${updatedAnchorSet.anchors.length} anchors surviving`
-                  );
-                }
-              }
-            }
+            // === FUSED MEASUREMENT ===
+            const finalX = fused.x;
+            const finalY = fused.y;
+            const finalConfidence = fused.confidence;
 
             // Successful tracking - apply Kalman smoothing
             const kalman = kalmanUpdate(tracker, finalX, finalY);
 
             // Smooth interpolation
-            const smoothX = tracker.x + (kalman.x - tracker.x) * CONFIG.SMOOTHING_FACTOR;
-            const smoothY = tracker.y + (kalman.y - tracker.y) * CONFIG.SMOOTHING_FACTOR;
+            const smoothSpeed = Math.hypot(kalman.vx, kalman.vy);
+            const motionFactor = clamp(
+              smoothSpeed / Math.max(1, adaptiveFlowConfig.SEARCH_RADIUS),
+              0,
+              1
+            );
+            const smoothingFactor = lerp(CONFIG.SMOOTHING_FACTOR, 0.85, motionFactor);
+            const smoothX = tracker.x + (kalman.x - tracker.x) * smoothingFactor;
+            const smoothY = tracker.y + (kalman.y - tracker.y) * smoothingFactor;
+            const now = Date.now();
+            let updatedEmbedding = tracker.reidEmbedding ?? null;
+            let updatedEmbeddingAt = tracker.lastEmbeddingUpdate ?? 0;
+            let updatedTemplate = tracker.template ?? null;
+            let templateMean = tracker.templateMean ?? 0;
+            let templateStd = tracker.templateStd ?? 0;
+            let lastTemplateUpdate = tracker.lastTemplateUpdate ?? 0;
+
+            if (
+              finalConfidence > 0.7 &&
+              now - updatedEmbeddingAt > REID_UPDATE_INTERVAL_MS
+            ) {
+              const embedding = computeReIdEmbedding(
+                currentFrame,
+                smoothX,
+                smoothY,
+                width,
+                height,
+                reidConfig
+              );
+              if (embedding) {
+                updatedEmbedding = blendEmbeddings(
+                  updatedEmbedding,
+                  embedding,
+                  reidConfig.updateAlpha
+                );
+                updatedEmbeddingAt = now;
+              }
+            }
+
+            if (
+              finalConfidence > TEMPLATE_CONFIG.UPDATE_CONFIDENCE &&
+              now - lastTemplateUpdate > TEMPLATE_CONFIG.UPDATE_INTERVAL_MS
+            ) {
+              const size = ensureOdd(tracker.templateSize ?? TEMPLATE_CONFIG.SIZE);
+              const newTemplate = captureTemplate(currentFrame, smoothX, smoothY, size);
+              if (newTemplate) {
+                if (updatedTemplate && updatedTemplate.length === newTemplate.length) {
+                  updatedTemplate = blendTemplate(
+                    updatedTemplate,
+                    newTemplate,
+                    TEMPLATE_CONFIG.UPDATE_ALPHA
+                  );
+                } else {
+                  updatedTemplate = newTemplate;
+                }
+                const stats = computeTemplateStats(updatedTemplate);
+                templateMean = stats.mean;
+                templateStd = stats.std;
+                lastTemplateUpdate = now;
+              }
+            }
 
             return {
               ...tracker,
@@ -2593,6 +3674,12 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               framesOccluded: 0,
               lastGoodPosition: { x: smoothX, y: smoothY },
               label: newLabel,
+              reidEmbedding: updatedEmbedding,
+              lastEmbeddingUpdate: updatedEmbeddingAt,
+              template: updatedTemplate,
+              templateMean,
+              templateStd,
+              lastTemplateUpdate,
               bboxWidth,
               bboxHeight,
               bboxConfidence,
@@ -2607,6 +3694,11 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
           // === LOST/SEARCHING STATE: Try re-identification ===
           if (tracker.state === "lost" || tracker.state === "searching") {
             const newFramesLost = tracker.framesLost + 1;
+            const adaptiveFlowConfig = getAdaptiveFlowConfig(
+              flowConfig,
+              tracker,
+              frameGlobalMotion
+            );
 
             // === HYBRID RE-ID: Check YOLO detections first ===
             if (yoloMatch && yoloMatch.detection.confidence > 0.4) {
@@ -2657,7 +3749,7 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
                 // Look within expanded search area for lost trackers
                 if (
-                  dist < flowConfig.SEARCH_RADIUS * 4 &&
+                  dist < adaptiveFlowConfig.SEARCH_RADIUS * 4 &&
                   (!bestUnmatched || dist < bestUnmatched.dist)
                 ) {
                   bestUnmatched = { detection: det, dist };
@@ -2697,13 +3789,56 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               }
             }
 
+            if (
+              tracker.template &&
+              tracker.templateStd &&
+              tracker.templateMean &&
+              newFramesLost % 4 === 0
+            ) {
+              const templateMatch = matchTemplate(
+                currentFrame,
+                tracker.template,
+                { mean: tracker.templateMean, std: tracker.templateStd },
+                tracker.lastGoodPosition.x,
+                tracker.lastGoodPosition.y,
+                width,
+                height,
+                adaptiveFlowConfig.SEARCH_RADIUS * 4,
+                TEMPLATE_CONFIG.COARSE_STEP,
+                Math.max(0.4, TEMPLATE_CONFIG.MIN_NCC - 0.1)
+              );
+
+              if (templateMatch) {
+                return {
+                  ...tracker,
+                  x: templateMatch.x,
+                  y: templateMatch.y,
+                  prevX: templateMatch.x,
+                  prevY: templateMatch.y,
+                  kalmanX: templateMatch.x,
+                  kalmanY: templateMatch.y,
+                  kalmanVx: 0,
+                  kalmanVy: 0,
+                  state: "tracking" as TrackerState,
+                  confidence: templateMatch.confidence,
+                  framesLost: 0,
+                  framesOccluded: 0,
+                  lastGoodPosition: { x: templateMatch.x, y: templateMatch.y },
+                  history: [
+                    ...tracker.history.slice(-CONFIG.TRAIL_LENGTH),
+                    { x: templateMatch.x, y: templateMatch.y, timestamp: Date.now() }
+                  ]
+                };
+              }
+            }
+
             // Fallback: Periodically search for re-ID using color signature
             if (newFramesLost % 5 === 0 && tracker.colorSignature) {
               const scaleFactor = CONFIG.SEARCH_RADIUS
-                ? flowConfig.SEARCH_RADIUS / CONFIG.SEARCH_RADIUS
+                ? adaptiveFlowConfig.SEARCH_RADIUS / CONFIG.SEARCH_RADIUS
                 : 1;
               const gridStep = Math.max(8, Math.round(30 * scaleFactor));
-              const roiRadius = Math.max(flowConfig.SEARCH_RADIUS * 4, 80 * scaleFactor);
+              const roiRadius = Math.max(adaptiveFlowConfig.SEARCH_RADIUS * 4, 80 * scaleFactor);
               const useFullSearch = newFramesLost % 25 === 0;
               const roi = useFullSearch
                 ? undefined
@@ -2717,8 +3852,12 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
               const found = searchForTracker(currentFrame, tracker, width, height, {
                 gridStep,
                 sampleRadius: colorSampleRadius,
-                boundaryGuard: flowConfig.BOUNDARY_GUARD,
-                roi
+                boundaryGuard: adaptiveFlowConfig.BOUNDARY_GUARD,
+                roi,
+                embedding: tracker.reidEmbedding ?? null,
+                embeddingConfig: reidConfig,
+                maxCandidates: reidConfig.maxCandidates,
+                embeddingThreshold: reidConfig.matchThreshold
               });
 
               if (found) {
@@ -2798,12 +3937,34 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
           // === INDEPENDENT DRAWINGS WITH ANCHOR TRACKING ===
           if (drawing.useAnchors && drawing.anchorSet && prevFrame) {
+            const drawingState = drawing.state ?? "tracking";
+            const drawingFramesLost = drawing.framesLost ?? 0;
+            
+            // If lost too long, skip tracking
+            if (drawingState === "lost" && drawingFramesLost > CONFIG.LOST_TIMEOUT) {
+              return drawing;
+            }
+            
+            const motionBoost = clamp(
+              1 + Math.hypot(frameGlobalMotion.dx, frameGlobalMotion.dy) * 0.05,
+              1,
+              2
+            );
+            const anchorSearchRadius = Math.max(
+              6,
+              Math.round(anchorConfig.ANCHOR_SEARCH_RADIUS * motionBoost)
+            );
+            const anchorInput =
+              frameGlobalMotion.confidence > 0.2
+                ? offsetAnchorSet(drawing.anchorSet, frameGlobalMotion.dx, frameGlobalMotion.dy)
+                : drawing.anchorSet;
+
             // Track anchors for this drawing
             const updatedAnchorSet = trackAnchors(
-              drawing.anchorSet,
+              anchorInput,
               prevFrame,
               currentFrame,
-              anchorConfig
+              { ...anchorConfig, ANCHOR_SEARCH_RADIUS: anchorSearchRadius }
             );
 
             // Get consensus position from anchors
@@ -2826,6 +3987,10 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
                   x: p.x + dx,
                   y: p.y + dy
                 }));
+                
+                // Calculate velocity
+                const newVelocityX = dx * 0.7 + (drawing.velocityX ?? 0) * 0.3;
+                const newVelocityY = dy * 0.7 + (drawing.velocityY ?? 0) * 0.3;
 
                 return {
                   ...drawing,
@@ -2835,16 +4000,59 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
                   centroidX: anchorPosition.x,
                   centroidY: anchorPosition.y,
                   anchorSet: updatedAnchorSet,
-                  aiConfidence: anchorPosition.confidence
+                  confidence: anchorPosition.confidence,
+                  aiConfidence: anchorPosition.confidence,
+                  state: "tracking" as TrackerState,
+                  framesLost: 0,
+                  velocityX: newVelocityX,
+                  velocityY: newVelocityY
                 };
               }
+              
+              // Good anchors but no significant movement
+              return {
+                ...drawing,
+                anchorSet: updatedAnchorSet,
+                confidence: anchorPosition.confidence,
+                state: "tracking" as TrackerState,
+                framesLost: 0
+              };
             }
+            
+            // Poor anchor confidence - may be losing track
+            const newFramesLost = drawingFramesLost + 1;
+            const newState = newFramesLost > CONFIG.OCCLUSION_TIMEOUT ? "lost" as TrackerState : drawingState;
 
-            // Update anchor set even if no movement
+            // Update anchor set even if poor confidence
             return {
               ...drawing,
-              anchorSet: updatedAnchorSet
+              anchorSet: updatedAnchorSet,
+              state: newState,
+              framesLost: newFramesLost,
+              confidence: Math.max(0.1, (drawing.confidence ?? 1) * 0.95)
             };
+          }
+          
+          // Independent drawing without anchors - apply global motion if available
+          if (!drawing.trackerId && frameGlobalMotion.confidence > 0.3) {
+            const dx = frameGlobalMotion.dx;
+            const dy = frameGlobalMotion.dy;
+            
+            if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+              const newPoints = drawing.points.map((p) => ({
+                x: p.x + dx,
+                y: p.y + dy
+              }));
+              
+              return {
+                ...drawing,
+                points: newPoints,
+                prevCentroidX: drawing.centroidX,
+                prevCentroidY: drawing.centroidY,
+                centroidX: (drawing.centroidX ?? 0) + dx,
+                centroidY: (drawing.centroidY ?? 0) + dy
+              };
+            }
           }
 
           return drawing;
@@ -2852,221 +4060,383 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
       );
 
       prevFrameRef.current = currentFrame;
-
-      // === AI-POWERED OBJECT-AWARE TRACKING ===
-      // Trigger async AI operations based on tracker state (non-blocking)
-      if (openaiKey && canvasRef.current) {
-        const canvas = canvasRef.current;
-
-        trackersRef.current.forEach((tracker) => {
-          const now = Date.now();
-          const anchorConfig = anchorConfigRef.current;
-          const displayPoint = toDisplayCoords(tracker.x, tracker.y);
-          const displayLastGood = toDisplayCoords(
-            tracker.lastGoodPosition.x,
-            tracker.lastGoodPosition.y
-          );
-          const aiTracker: Tracker = {
-            ...tracker,
-            x: displayPoint.x,
-            y: displayPoint.y,
-            lastGoodPosition: {
-              x: displayLastGood.x,
-              y: displayLastGood.y
-            }
-          };
-
-          // Skip trackers without AI identification
-          if (!tracker.objectDescription && !tracker.visualFeatures) {
-            return;
-          }
-
-          // === AI VALIDATION: Check if we're still tracking the right object ===
-          // Triggers when:
-          // 1. Confidence drops below threshold, OR
-          // 2. Periodic validation time has passed (important for anchor mode!)
-          // This ensures AI validates even when anchors provide high confidence
-          const timeSinceLastValidation = now - (tracker.lastAIValidation ?? 0);
-          const anchorsStable =
-            tracker.useAnchors &&
-            tracker.anchorSet &&
-            tracker.anchorSet.coherenceScore >= anchorConfig.MIN_COHERENCE &&
-            tracker.anchorSet.survivingCount >= anchorConfig.MIN_ANCHORS;
-          const periodicInterval = anchorsStable
-            ? AI_CONFIG.PERIODIC_VALIDATION_MS * 2
-            : AI_CONFIG.PERIODIC_VALIDATION_MS;
-          const needsPeriodicValidation =
-            AI_CONFIG.VALIDATE_WITH_ANCHORS &&
-            tracker.useAnchors &&
-            timeSinceLastValidation > periodicInterval;
-          const needsConfidenceValidation =
-            tracker.confidence < AI_CONFIG.VALIDATION_CONFIDENCE_THRESHOLD &&
-            timeSinceLastValidation > AI_CONFIG.VALIDATION_COOLDOWN_MS;
-          const needsAnchorValidation =
-            tracker.useAnchors &&
-            tracker.anchorSet &&
-            tracker.anchorSet.coherenceScore < anchorConfig.MIN_COHERENCE &&
-            timeSinceLastValidation > AI_CONFIG.VALIDATION_COOLDOWN_MS;
-          
-          if (
-            AI_CONFIG.VALIDATION_ON_OCCLUSION &&
-            (tracker.state === "tracking" || tracker.state === "occluded") &&
-            (needsConfidenceValidation || needsPeriodicValidation || needsAnchorValidation) &&
-            !tracker.pendingAIValidation &&
-            !aiValidationGuardRef.current.has(tracker.id)
-          ) {
-            // Mark as pending to prevent duplicate calls
-            aiValidationGuardRef.current.add(tracker.id);
-            setTrackers((prev) =>
-              prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIValidation: true } : t))
-            );
-
-            // Async validation
-            validateTrackedObject(canvas, aiTracker, openaiKey)
-              .then((result) => {
-                setTrackers((prev) =>
-                  prev.map((t) => {
-                    if (t.id !== tracker.id) return t;
-
-                    // Clear pending flag
-                    const updated: Tracker = {
-                      ...t,
-                      pendingAIValidation: false,
-                      lastAIValidation: Date.now(),
-                      aiConfidence: result.confidence
-                    };
-
-                    // If AI says we're NOT on the object anymore → go to LOST
-                    if (!result.isValid && result.confidence > 0.6) {
-                      console.info(
-                        `[AI Validation] "${tracker.label}" is no longer at marker! Triggering re-acquisition.`
-                      );
-                      return {
-                        ...updated,
-                        state: "lost" as TrackerState,
-                        framesLost: 0,
-                        confidence: 0.2
-                      };
-                    }
-
-                    // AI confirms we're still on the object → boost confidence
-                    if (result.isValid && result.confidence > 0.7) {
-                      console.info(`[AI Validation] Confirmed: still tracking "${tracker.label}"`);
-                      return {
-                        ...updated,
-                        confidence: Math.max(t.confidence, result.confidence * 0.8)
-                      };
-                    }
-
-                    return updated;
-                  })
-                );
-              })
-              .catch((err) => {
-                console.error("[AI Validation] Error:", err);
-                setTrackers((prev) =>
-                  prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIValidation: false } : t))
-                );
-              })
-              .finally(() => {
-                aiValidationGuardRef.current.delete(tracker.id);
-              });
-          }
-
-          // === AI RE-ACQUISITION: Find the lost object ===
-          if (
-            (tracker.state === "lost" || tracker.state === "searching") &&
-            tracker.framesLost >= AI_CONFIG.REACQUISITION_START_FRAME &&
-            tracker.framesLost % AI_CONFIG.REACQUISITION_INTERVAL_FRAMES === 0 &&
-            !tracker.pendingAIReacquisition &&
-            !tracker.label.startsWith("Region") && // Only search for identified objects
-            !aiReacqGuardRef.current.has(tracker.id)
-          ) {
-            // Mark as pending to prevent duplicate calls
-            aiReacqGuardRef.current.add(tracker.id);
-            setTrackers((prev) =>
-              prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIReacquisition: true } : t))
-            );
-
-            console.info(`[AI Re-acquisition] Searching for "${tracker.label}"...`);
-
-            // Async re-acquisition
-            findObjectInFrame(canvas, aiTracker, openaiKey)
-              .then((result) => {
-                setTrackers((prev) =>
-                  prev.map((t) => {
-                    if (t.id !== tracker.id) return t;
-
-                    // Clear pending flag
-                    const updated: Tracker = { ...t, pendingAIReacquisition: false };
-
-                    if (
-                      result &&
-                      result.found &&
-                      result.confidence >= AI_CONFIG.REACQUISITION_MIN_CONFIDENCE
-                    ) {
-                      const processingPoint = toProcessingCoords(result.x, result.y);
-                      // Found the object! Re-acquire
-                      console.info(
-                        `[AI Re-acquisition] Found "${tracker.label}" at (${result.x.toFixed(0)}, ${result.y.toFixed(0)}) with confidence ${result.confidence.toFixed(2)}`
-                      );
-                      return {
-                        ...updated,
-                        x: processingPoint.x,
-                        y: processingPoint.y,
-                        prevX: processingPoint.x,
-                        prevY: processingPoint.y,
-                        kalmanX: processingPoint.x,
-                        kalmanY: processingPoint.y,
-                        kalmanVx: 0,
-                        kalmanVy: 0,
-                        state: "tracking" as TrackerState,
-                        confidence: result.confidence,
-                        framesLost: 0,
-                        framesOccluded: 0,
-                        lastGoodPosition: {
-                          x: processingPoint.x,
-                          y: processingPoint.y
-                        },
-                        lastAIValidation: Date.now(),
-                        aiConfidence: result.confidence,
-                        history: [
-                          ...t.history.slice(-CONFIG.TRAIL_LENGTH),
-                          { x: processingPoint.x, y: processingPoint.y, timestamp: Date.now() }
-                        ]
-                      };
-                    }
-
-                    console.info(`[AI Re-acquisition] Could not find "${tracker.label}"`);
-                    return updated;
-                  })
-                );
-              })
-              .catch((err) => {
-                console.error("[AI Re-acquisition] Error:", err);
-                setTrackers((prev) =>
-                  prev.map((t) =>
-                    t.id === tracker.id ? { ...t, pendingAIReacquisition: false } : t
-                  )
-                );
-              })
-              .finally(() => {
-                aiReacqGuardRef.current.delete(tracker.id);
-              });
-          }
-        });
-      }
     },
     [
       isSetupMode,
       useServerDetection,
       interpolatedDetections,
-      openaiKey,
-      useAnchorTracking,
-      toDisplayCoords,
-      toProcessingCoords
+      useAnchorTracking
     ]
   );
+
+  const runAiTrackingChecks = useCallback(() => {
+    if (!openaiKey || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+
+    trackersRef.current.forEach((tracker) => {
+      const now = Date.now();
+      const anchorConfig = anchorConfigRef.current;
+      const displayPoint = toDisplayCoords(tracker.x, tracker.y);
+      const displayLastGood = toDisplayCoords(
+        tracker.lastGoodPosition.x,
+        tracker.lastGoodPosition.y
+      );
+      const aiTracker: Tracker = {
+        ...tracker,
+        x: displayPoint.x,
+        y: displayPoint.y,
+        lastGoodPosition: {
+          x: displayLastGood.x,
+          y: displayLastGood.y
+        }
+      };
+
+      if (!tracker.objectDescription && !tracker.visualFeatures) {
+        return;
+      }
+
+      const timeSinceLastValidation = now - (tracker.lastAIValidation ?? 0);
+      const anchorsStable =
+        tracker.useAnchors &&
+        tracker.anchorSet &&
+        tracker.anchorSet.coherenceScore >= anchorConfig.MIN_COHERENCE &&
+        tracker.anchorSet.survivingCount >= anchorConfig.MIN_ANCHORS;
+      const periodicInterval = anchorsStable
+        ? AI_CONFIG.PERIODIC_VALIDATION_MS * 2
+        : AI_CONFIG.PERIODIC_VALIDATION_MS;
+      const needsPeriodicValidation =
+        AI_CONFIG.VALIDATE_WITH_ANCHORS &&
+        tracker.useAnchors &&
+        timeSinceLastValidation > periodicInterval;
+      const needsConfidenceValidation =
+        tracker.confidence < AI_CONFIG.VALIDATION_CONFIDENCE_THRESHOLD &&
+        timeSinceLastValidation > AI_CONFIG.VALIDATION_COOLDOWN_MS;
+      const needsAnchorValidation =
+        tracker.useAnchors &&
+        tracker.anchorSet &&
+        tracker.anchorSet.coherenceScore < anchorConfig.MIN_COHERENCE &&
+        timeSinceLastValidation > AI_CONFIG.VALIDATION_COOLDOWN_MS;
+
+      if (
+        AI_CONFIG.VALIDATION_ON_OCCLUSION &&
+        (tracker.state === "tracking" || tracker.state === "occluded") &&
+        (needsConfidenceValidation || needsPeriodicValidation || needsAnchorValidation) &&
+        !tracker.pendingAIValidation &&
+        !aiValidationGuardRef.current.has(tracker.id)
+      ) {
+        aiValidationGuardRef.current.add(tracker.id);
+        editVersionRef.current += 1;
+        setTrackers((prev) =>
+          prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIValidation: true } : t))
+        );
+
+        console.info(`[AI Validation] Checking "${tracker.label}" (confidence: ${tracker.confidence.toFixed(2)})...`);
+        validateTrackedObject(canvas, aiTracker, openaiKey)
+          .then((result) => {
+            editVersionRef.current += 1;
+            setTrackers((prev) =>
+              prev.map((t) => {
+                if (t.id !== tracker.id) return t;
+
+                const priorStrikes = t.aiValidationStrikes ?? 0;
+                const nextStrikes = result.isValid ? 0 : priorStrikes + 1;
+                const updated: Tracker = {
+                  ...t,
+                  pendingAIValidation: false,
+                  lastAIValidation: Date.now(),
+                  aiConfidence: result.confidence,
+                  aiValidationStrikes: nextStrikes
+                };
+
+                if (
+                  !result.isValid &&
+                  result.confidence > 0.8 &&
+                  nextStrikes >= 2 &&
+                  t.confidence < 0.5
+                ) {
+                  console.info(
+                    `[AI Validation] "${tracker.label}" is no longer at marker! Triggering re-acquisition.`
+                  );
+                  return {
+                    ...updated,
+                    state: "lost" as TrackerState,
+                    framesLost: 0,
+                    confidence: 0.2
+                  };
+                }
+
+                if (!result.isValid) {
+                  return {
+                    ...updated,
+                    confidence: Math.max(t.confidence * 0.6, 0.1)
+                  };
+                }
+
+                if (result.isValid && result.confidence > 0.7) {
+                  console.info(`[AI Validation] Confirmed: still tracking "${tracker.label}"`);
+                  return {
+                    ...updated,
+                    confidence: Math.max(t.confidence, result.confidence * 0.8)
+                  };
+                }
+
+                return updated;
+              })
+            );
+          })
+          .catch((err) => {
+            console.error("[AI Validation] Error:", err);
+            editVersionRef.current += 1;
+            setTrackers((prev) =>
+              prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIValidation: false } : t))
+            );
+          })
+          .finally(() => {
+            aiValidationGuardRef.current.delete(tracker.id);
+          });
+      }
+
+      // Re-acquisition: Try AI search when object is lost
+      // Trigger at START_FRAME, then every INTERVAL frames after
+      const framesSinceStart = tracker.framesLost - AI_CONFIG.REACQUISITION_START_FRAME;
+      const shouldReacquire = 
+        tracker.framesLost === AI_CONFIG.REACQUISITION_START_FRAME ||
+        (framesSinceStart > 0 && framesSinceStart % AI_CONFIG.REACQUISITION_INTERVAL_FRAMES === 0);
+      
+      if (
+        (tracker.state === "lost" || tracker.state === "searching") &&
+        shouldReacquire &&
+        !tracker.pendingAIReacquisition &&
+        !tracker.label.startsWith("Region") &&
+        !aiReacqGuardRef.current.has(tracker.id)
+      ) {
+        aiReacqGuardRef.current.add(tracker.id);
+        editVersionRef.current += 1;
+        setTrackers((prev) =>
+          prev.map((t) => (t.id === tracker.id ? { ...t, pendingAIReacquisition: true } : t))
+        );
+
+        console.info(`[AI Re-acquisition] Searching for "${tracker.label}"...`);
+
+        findObjectInFrame(canvas, aiTracker, openaiKey)
+          .then((result) => {
+            editVersionRef.current += 1;
+            setTrackers((prev) =>
+              prev.map((t) => {
+                if (t.id !== tracker.id) return t;
+
+                const updated: Tracker = { ...t, pendingAIReacquisition: false };
+
+                if (
+                  result &&
+                  result.found &&
+                  result.confidence >= AI_CONFIG.REACQUISITION_MIN_CONFIDENCE
+                ) {
+                  const processingPoint = toProcessingCoords(result.x, result.y);
+                  console.info(
+                    `[AI Re-acquisition] Found "${tracker.label}" at (${result.x.toFixed(0)}, ${result.y.toFixed(0)}) with confidence ${result.confidence.toFixed(2)}`
+                  );
+                  return {
+                    ...updated,
+                    x: processingPoint.x,
+                    y: processingPoint.y,
+                    prevX: processingPoint.x,
+                    prevY: processingPoint.y,
+                    kalmanX: processingPoint.x,
+                    kalmanY: processingPoint.y,
+                    kalmanVx: 0,
+                    kalmanVy: 0,
+                    state: "tracking" as TrackerState,
+                    confidence: result.confidence,
+                    framesLost: 0,
+                    framesOccluded: 0,
+                    lastGoodPosition: {
+                      x: processingPoint.x,
+                      y: processingPoint.y
+                    },
+                    lastAIValidation: Date.now(),
+                    aiConfidence: result.confidence,
+                    aiValidationStrikes: 0,
+                    history: [
+                      ...t.history.slice(-CONFIG.TRAIL_LENGTH),
+                      { x: processingPoint.x, y: processingPoint.y, timestamp: Date.now() }
+                    ]
+                  };
+                }
+
+                console.info(`[AI Re-acquisition] Could not find "${tracker.label}"`);
+                return updated;
+              })
+            );
+          })
+          .catch((err) => {
+            console.error("[AI Re-acquisition] Error:", err);
+            editVersionRef.current += 1;
+            setTrackers((prev) =>
+              prev.map((t) =>
+                t.id === tracker.id ? { ...t, pendingAIReacquisition: false } : t
+              )
+            );
+          })
+          .finally(() => {
+            aiReacqGuardRef.current.delete(tracker.id);
+          });
+      }
+    });
+    
+    // === AI TRACKING FOR INDEPENDENT DRAWINGS ===
+    drawingsRef.current.forEach((drawing) => {
+      // Skip tracker-attached drawings (they follow their tracker)
+      if (drawing.trackerId) return;
+      
+      const now = Date.now();
+      const displayPoint = toDisplayCoords(
+        drawing.centroidX ?? 0,
+        drawing.centroidY ?? 0
+      );
+      
+      // Create AI-compatible object for drawing
+      const aiDrawing = {
+        id: drawing.id,
+        x: displayPoint.x,
+        y: displayPoint.y,
+        label: drawing.label,
+        objectDescription: drawing.objectDescription,
+        visualFeatures: drawing.visualFeatures,
+        referenceImage: drawing.referenceImage
+      };
+      
+      const timeSinceLastValidation = now - (drawing.lastAIValidation ?? 0);
+      const drawingState = drawing.state ?? "tracking";
+      const drawingFramesLost = drawing.framesLost ?? 0;
+      
+      // AI VALIDATION for drawings
+      const needsValidation = 
+        (drawing.confidence ?? 1) < AI_CONFIG.VALIDATION_CONFIDENCE_THRESHOLD &&
+        timeSinceLastValidation > AI_CONFIG.VALIDATION_COOLDOWN_MS;
+      const needsPeriodicValidation = timeSinceLastValidation > AI_CONFIG.PERIODIC_VALIDATION_MS;
+      
+      if (
+        drawingState === "tracking" &&
+        (needsValidation || needsPeriodicValidation) &&
+        !drawing.pendingAIValidation &&
+        !drawing.label.startsWith("Region") &&
+        !aiValidationGuardRef.current.has(drawing.id)
+      ) {
+        aiValidationGuardRef.current.add(drawing.id);
+        editVersionRef.current += 1;
+        setDrawings((prev) =>
+          prev.map((d) => (d.id === drawing.id ? { ...d, pendingAIValidation: true } : d))
+        );
+        
+        console.info(`[AI Drawing Validation] Checking "${drawing.label}"...`);
+        validateTrackedObject(canvas, aiDrawing, openaiKey)
+          .then((result) => {
+            editVersionRef.current += 1;
+            setDrawings((prev) =>
+              prev.map((d) => {
+                if (d.id !== drawing.id) return d;
+                const updated = { ...d, pendingAIValidation: false, lastAIValidation: Date.now() };
+                
+                if (!result.isValid) {
+                  console.info(`[AI Drawing Validation] "${drawing.label}" no longer at position - marking lost`);
+                  return {
+                    ...updated,
+                    state: "lost" as TrackerState,
+                    framesLost: 0,
+                    confidence: 0.2
+                  };
+                }
+                
+                return {
+                  ...updated,
+                  aiConfidence: result.confidence,
+                  confidence: Math.max(d.confidence ?? 0, result.confidence)
+                };
+              })
+            );
+          })
+          .catch((err) => {
+            console.error("[AI Drawing Validation] Error:", err);
+            setDrawings((prev) =>
+              prev.map((d) => (d.id === drawing.id ? { ...d, pendingAIValidation: false } : d))
+            );
+          })
+          .finally(() => {
+            aiValidationGuardRef.current.delete(drawing.id);
+          });
+      }
+      
+      // AI RE-ACQUISITION for lost drawings
+      const framesSinceStart = drawingFramesLost - AI_CONFIG.REACQUISITION_START_FRAME;
+      const shouldReacquire = 
+        drawingFramesLost === AI_CONFIG.REACQUISITION_START_FRAME ||
+        (framesSinceStart > 0 && framesSinceStart % AI_CONFIG.REACQUISITION_INTERVAL_FRAMES === 0);
+      
+      if (
+        (drawingState === "lost" || drawingState === "searching") &&
+        shouldReacquire &&
+        !drawing.pendingAIReacquisition &&
+        !drawing.label.startsWith("Region") &&
+        !aiReacqGuardRef.current.has(drawing.id)
+      ) {
+        aiReacqGuardRef.current.add(drawing.id);
+        editVersionRef.current += 1;
+        setDrawings((prev) =>
+          prev.map((d) => (d.id === drawing.id ? { ...d, pendingAIReacquisition: true } : d))
+        );
+        
+        console.info(`[AI Drawing Re-acquisition] Searching for "${drawing.label}"...`);
+        findObjectInFrame(canvas, aiDrawing, openaiKey)
+          .then((result) => {
+            editVersionRef.current += 1;
+            setDrawings((prev) =>
+              prev.map((d) => {
+                if (d.id !== drawing.id) return d;
+                const updated = { ...d, pendingAIReacquisition: false };
+                
+                if (result && result.found && result.confidence >= AI_CONFIG.REACQUISITION_MIN_CONFIDENCE) {
+                  const processingPoint = toProcessingCoords(result.x, result.y);
+                  console.info(
+                    `[AI Drawing Re-acquisition] Found "${drawing.label}" at (${result.x.toFixed(0)}, ${result.y.toFixed(0)})`
+                  );
+                  
+                  // Calculate movement delta
+                  const dx = processingPoint.x - (d.centroidX ?? 0);
+                  const dy = processingPoint.y - (d.centroidY ?? 0);
+                  
+                  return {
+                    ...updated,
+                    centroidX: processingPoint.x,
+                    centroidY: processingPoint.y,
+                    prevCentroidX: processingPoint.x,
+                    prevCentroidY: processingPoint.y,
+                    points: d.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+                    state: "tracking" as TrackerState,
+                    framesLost: 0,
+                    confidence: result.confidence,
+                    lastAIValidation: Date.now(),
+                    aiConfidence: result.confidence
+                  };
+                }
+                
+                console.info(`[AI Drawing Re-acquisition] Could not find "${drawing.label}"`);
+                return updated;
+              })
+            );
+          })
+          .catch((err) => {
+            console.error("[AI Drawing Re-acquisition] Error:", err);
+            setDrawings((prev) =>
+              prev.map((d) => (d.id === drawing.id ? { ...d, pendingAIReacquisition: false } : d))
+            );
+          })
+          .finally(() => {
+            aiReacqGuardRef.current.delete(drawing.id);
+          });
+      }
+    });
+  }, [openaiKey, toDisplayCoords, toProcessingCoords]);
 
   // === RENDER LOOP ===
   useEffect(() => {
@@ -3095,7 +4465,48 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
       const processingCanvas =
         processingCanvasRef.current ?? (processingCanvasRef.current = document.createElement("canvas"));
-      const processingDims = getProcessingDimensions(canvas.width, canvas.height);
+      const baseProcessingConfig = PROCESSING_PRESETS[effectiveQuality];
+      
+      // Main thread optimization: use efficient resolution without sacrificing too much quality
+      const performanceScale = preferMainThread
+        ? processingFps > 0
+          ? processingFps < 20
+            ? 0.6   // Moderate reduction when below target
+            : 0.75  // Slight reduction when close to target
+          : 0.6     // Start moderate
+        : workerEnabled
+        ? 1
+        : processingFps > 0
+        ? processingFps < 8
+          ? 0.35
+          : processingFps < 12
+          ? 0.5
+          : processingFps < 18
+          ? 0.7
+          : 1
+        : 0.7;
+        
+      const processingConfig = workerEnabled
+        ? baseProcessingConfig
+        : preferMainThread
+        ? {
+            ...baseProcessingConfig,
+            MAX_WIDTH: Math.max(640, Math.round(baseProcessingConfig.MAX_WIDTH * performanceScale)),
+            MAX_HEIGHT: Math.max(360, Math.round(baseProcessingConfig.MAX_HEIGHT * performanceScale)),
+            TARGET_FPS: 30  // Target 30 FPS
+          }
+        : {
+            ...baseProcessingConfig,
+            MAX_WIDTH: Math.max(320, Math.round(baseProcessingConfig.MAX_WIDTH * performanceScale)),
+            MAX_HEIGHT: Math.max(180, Math.round(baseProcessingConfig.MAX_HEIGHT * performanceScale)),
+            TARGET_FPS: Math.min(baseProcessingConfig.TARGET_FPS, 12)
+          };
+      processingConfigRef.current = processingConfig;
+      const processingDims = getProcessingDimensions(
+        canvas.width,
+        canvas.height,
+        processingConfig
+      );
       const sizeChanged =
         processingCanvas.width !== processingDims.width ||
         processingCanvas.height !== processingDims.height;
@@ -3106,12 +4517,69 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
       }
 
       processingScaleRef.current = processingDims.scale;
-      flowConfigRef.current = getScaledFlowConfig(processingDims.scale.scalar);
-      anchorConfigRef.current = getScaledAnchorConfig(processingDims.scale.scalar);
+      flowConfigRef.current = getScaledFlowConfig(processingDims.scale.scalar, preferMainThread);
+      const anchorOverrides: Partial<AnchorConfig> = isPrecisionQuality
+        ? { ...ANCHOR_PRECISION_OVERRIDES }
+        : {};
+      
+      // Balanced anchor settings for main thread - maintain quality with smart limits
+      if (preferMainThread) {
+        anchorOverrides.MAX_ANCHORS = Math.min(
+          anchorOverrides.MAX_ANCHORS ?? ANCHOR_CONFIG.MAX_ANCHORS,
+          8  // Reasonable number for good tracking
+        );
+        anchorOverrides.MIN_ANCHORS = 3;  // Keep minimum for reliability
+        anchorOverrides.ANCHOR_SEARCH_RADIUS = Math.min(
+          anchorOverrides.ANCHOR_SEARCH_RADIUS ?? ANCHOR_CONFIG.ANCHOR_SEARCH_RADIUS,
+          24  // Adequate search radius
+        );
+        anchorOverrides.ANCHOR_TEMPLATE_SIZE = 11; // Good template size
+      } else if (!workerEnabled && fps > 0 && fps < 12) {
+        anchorOverrides.MAX_ANCHORS = Math.min(
+          anchorOverrides.MAX_ANCHORS ?? ANCHOR_CONFIG.MAX_ANCHORS,
+          8
+        );
+        anchorOverrides.MIN_ANCHORS = Math.min(
+          anchorOverrides.MIN_ANCHORS ?? ANCHOR_CONFIG.MIN_ANCHORS,
+          3
+        );
+        anchorOverrides.ANCHOR_SEARCH_RADIUS = Math.min(
+          anchorOverrides.ANCHOR_SEARCH_RADIUS ?? ANCHOR_CONFIG.ANCHOR_SEARCH_RADIUS,
+          26
+        );
+      }
+      anchorConfigRef.current = getScaledAnchorConfig(
+        processingDims.scale.scalar,
+        Object.keys(anchorOverrides).length ? anchorOverrides : undefined
+      );
+      globalMotionConfigRef.current = getScaledGlobalMotionConfig(processingDims.scale.scalar);
       colorSampleRadiusRef.current = Math.max(
         8,
         Math.round(CONFIG.COLOR_SAMPLE_SIZE * processingDims.scale.scalar)
       );
+      
+      // Balanced ReID for main thread mode - maintain quality
+      const reidBase = preferMainThread
+        ? {
+            ...DEFAULT_REID_CONFIG,
+            cropSize: 120,       // Good quality crop
+            downsampleSize: 30,  // Reasonable downsample
+            gridSize: 8,         // Decent grid
+            matchThreshold: 0.68 // Balanced threshold
+          }
+        : isPrecisionQuality
+        ? {
+            ...DEFAULT_REID_CONFIG,
+            cropSize: 160,
+            downsampleSize: 40,
+            gridSize: 10,
+            matchThreshold: 0.72
+          }
+        : DEFAULT_REID_CONFIG;
+      reidConfigRef.current = {
+        ...reidBase,
+        cropSize: Math.max(60, Math.round(reidBase.cropSize * processingDims.scale.scalar))
+      };
 
       const processingCtx = processingCanvas.getContext("2d", { willReadFrequently: true });
       if (!processingCtx) {
@@ -3130,22 +4598,140 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
 
       if (isPlaying && !isSetupMode) {
         const now = performance.now();
-        const minInterval = 1000 / PROCESSING_CONFIG.TARGET_FPS;
-        let processed = false;
-        if (now - lastProcessTimeRef.current >= minInterval) {
-          updateTrackers(processingCtx, processingCanvas.width, processingCanvas.height);
-          lastProcessTimeRef.current = now;
-          processed = true;
+        const canUseWorker = !preferMainThread && workerEnabled && workerRef.current && workerReadyRef.current;
+        
+        // Main thread mode: Run tracking async at controlled intervals
+        if (!canUseWorker && preferMainThread) {
+          mainThreadFrameCounterRef.current++;
+          
+          // Smart adaptive frame skip targeting 30+ tracking FPS
+          let skipInterval = mainThreadSkipIntervalRef.current;
+          if (processingFps > 0) {
+            if (processingFps < 15) {
+              skipInterval = 3; // Run tracking every 3rd frame when below target
+            } else if (processingFps < 25) {
+              skipInterval = 2; // Run tracking every 2nd frame when getting close
+            } else {
+              skipInterval = 1; // Run tracking every frame when hitting target
+            }
+            mainThreadSkipIntervalRef.current = skipInterval;
+          }
+          
+          // Only run tracking on designated frames and if not already busy
+          if (mainThreadFrameCounterRef.current % skipInterval === 0 && !mainThreadTrackingBusyRef.current) {
+            const minInterval = 1000 / processingConfigRef.current.TARGET_FPS;
+            
+            if (now - lastProcessTimeRef.current >= minInterval) {
+              lastProcessTimeRef.current = now;
+              processingFrameCountRef.current += 1;
+              mainThreadTrackingBusyRef.current = true;
+              
+              // Use setTimeout(0) for true async execution that doesn't block render
+              setTimeout(() => {
+                try {
+                  updateTrackers(processingCtx, processingCanvas.width, processingCanvas.height);
+                } finally {
+                  mainThreadTrackingBusyRef.current = false;
+                }
+              }, 0);
+            }
+          }
+        } else if (canUseWorker) {
+          // Worker mode: existing logic
+          const minInterval = 1000 / processingConfigRef.current.TARGET_FPS;
+          if (now - lastProcessTimeRef.current >= minInterval) {
+            lastProcessTimeRef.current = now;
+            processingFrameCountRef.current += 1;
 
-          // Send frame to server for YOLO detection
-          if (useServerDetection && serverConnected) {
-            sendFrameToServer(processingCanvas);
+            if (!workerBusyRef.current && !captureInFlightRef.current) {
+              const sessionId = workerSessionRef.current;
+              const frameId = workerFrameIdRef.current + 1;
+              workerFrameIdRef.current = frameId;
+              const editVersion = editVersionRef.current;
+              captureInFlightRef.current = true;
+              const flowConfig = flowConfigRef.current;
+              const anchorConfig = anchorConfigRef.current;
+              const colorSampleRadius = colorSampleRadiusRef.current;
+              const reidConfig = reidConfigRef.current;
+              const trackersSnapshot = trackersRef.current;
+              const drawingsSnapshot = drawingsRef.current;
+              const detectionsSnapshot = interpolatedDetections;
+
+              const sendToWorker = (bitmap: ImageBitmap) => {
+                if (!workerRef.current) {
+                  bitmap.close();
+                  captureInFlightRef.current = false;
+                  return;
+                }
+                workerBusyRef.current = true;
+                workerRef.current.postMessage(
+                  {
+                    type: "frame",
+                    frameId,
+                    sessionId,
+                    editVersion,
+                    width: processingCanvas.width,
+                    height: processingCanvas.height,
+                    imageBitmap: bitmap,
+                    trackers: trackersSnapshot,
+                    drawings: drawingsSnapshot,
+                    flowConfig,
+                    anchorConfig,
+                    colorSampleRadius,
+                    reidConfig,
+                    useServerDetection,
+                    useAnchorTracking,
+                    yoloDetections: detectionsSnapshot
+                  },
+                  [bitmap]
+                );
+                captureInFlightRef.current = false;
+              };
+              const fallbackToMain = () => {
+                updateTrackers(processingCtx, processingCanvas.width, processingCanvas.height);
+                workerBusyRef.current = false;
+                captureInFlightRef.current = false;
+              };
+
+              const resizeOptions = {
+                resizeWidth: processingCanvas.width,
+                resizeHeight: processingCanvas.height,
+                resizeQuality: "high" as const
+              };
+
+              if (typeof createImageBitmap === "function") {
+                createImageBitmap(video, resizeOptions)
+                  .then(sendToWorker)
+                  .catch(() => {
+                    createImageBitmap(processingCanvas)
+                      .then(sendToWorker)
+                      .catch(fallbackToMain);
+                  });
+              } else {
+                fallbackToMain();
+              }
+            }
+          }
+        } else if (!canUseWorker && !preferMainThread) {
+          // Legacy synchronous main thread mode (when worker is off but not explicitly preferred)
+          const minInterval = 1000 / processingConfigRef.current.TARGET_FPS;
+          if (now - lastProcessTimeRef.current >= minInterval) {
+            lastProcessTimeRef.current = now;
+            processingFrameCountRef.current += 1;
+            updateTrackers(processingCtx, processingCanvas.width, processingCanvas.height);
           }
         }
 
-        if (!processed && useServerDetection && serverConnected) {
+        if (useServerDetection && serverConnected) {
           sendFrameToServer(processingCanvas);
         }
+      }
+
+      // Run AI checks but throttle in main thread mode
+      if (isPlaying && !isSetupMode) {
+        // AI checks are async and don't block the main thread, so run them every frame
+        // The AI functions have their own internal cooldowns to prevent API spam
+        runAiTrackingChecks();
       }
 
       frameCountRef.current++;
@@ -3154,6 +4740,16 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
         setFps(Math.round((frameCountRef.current * 1000) / (now - lastFpsUpdateRef.current)));
         frameCountRef.current = 0;
         lastFpsUpdateRef.current = now;
+      }
+      if (now - lastProcessingFpsUpdateRef.current > 1000) {
+        setProcessingFps(
+          Math.round(
+            (processingFrameCountRef.current * 1000) /
+              (now - lastProcessingFpsUpdateRef.current)
+          )
+        );
+        processingFrameCountRef.current = 0;
+        lastProcessingFpsUpdateRef.current = now;
       }
 
       // Render local tracking annotations
@@ -3199,12 +4795,18 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
     currentDrawing,
     selectedTracker,
     updateTrackers,
+    runAiTrackingChecks,
     useServerDetection,
     serverConnected,
     sendFrameToServer,
     showServerDetections,
     interpolatedDetections,
-    useAnchorTracking
+    useAnchorTracking,
+    workerEnabled,
+    trackingQuality,
+    fps,
+    processingFps,
+    preferMainThread
   ]);
 
   const getStateStyle = (state: TrackerState): React.CSSProperties => {
@@ -3228,6 +4830,68 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
     return { background: "rgba(245, 158, 11, 0.2)", color: "#f59e0b" };
   };
 
+  const workerLabel =
+    workerStatus === "on"
+      ? "Worker on"
+      : workerStatus === "starting"
+      ? "Worker starting"
+      : workerStatus === "error"
+      ? "Worker error"
+      : "Worker off";
+  const workerBadgeStyle = {
+    ...styles.statusBadge,
+    color:
+      workerStatus === "on"
+        ? "#10b981"
+        : workerStatus === "starting"
+        ? "#f59e0b"
+        : workerStatus === "error"
+        ? "#ef4444"
+        : "#ef4444",
+    background:
+      workerStatus === "on"
+        ? "rgba(16, 185, 129, 0.15)"
+        : workerStatus === "starting"
+        ? "rgba(245, 158, 11, 0.15)"
+        : "rgba(239, 68, 68, 0.15)"
+  };
+  const openCvLabel =
+    openCvReady === null 
+      ? (workerEnabled ? "OpenCV loading..." : "OpenCV idle")
+      : openCvReady 
+      ? "OpenCV OK" 
+      : "OpenCV error";
+  const openCvTooltip = openCvError ?? (openCvReady === null ? "Waiting for OpenCV to initialize" : "");
+  const openCvBadgeStyle = {
+    ...styles.statusBadge,
+    color: openCvReady ? "#10b981" : openCvReady === null ? (workerEnabled ? "#3b82f6" : "#94a3b8") : "#ef4444",
+    background: openCvReady
+      ? "rgba(16, 185, 129, 0.15)"
+      : openCvReady === null
+      ? (workerEnabled ? "rgba(59, 130, 246, 0.15)" : "rgba(148, 163, 184, 0.15)")
+      : "rgba(239, 68, 68, 0.15)"
+  };
+  const qualityLabel = workerEnabled
+    ? trackingQuality === "precision"
+      ? "🎯 Precision"
+      : "⚡ Balanced"
+    : workerStatus === "starting"
+    ? "Starting worker..."
+    : workerStatus === "error"
+    ? "Retry Worker"
+    : "🧵 Enable Worker";
+  const displayFps = isPlaying && !isSetupMode ? processingFps : fps;
+  const displayFpsLabel = isPlaying && !isSetupMode ? "Proc" : "UI";
+  
+  // Calculate tracking interval message for main thread mode
+  const trackingIntervalMsg = preferMainThread && isPlaying && !isSetupMode
+    ? mainThreadSkipIntervalRef.current === 1
+      ? "every frame"
+      : mainThreadSkipIntervalRef.current === 2
+      ? "every 2nd frame"
+      : `every ${mainThreadSkipIntervalRef.current}rd frame`
+    : null;
+
   return (
     <div style={styles.container}>
       <div style={styles.header}>
@@ -3242,11 +4906,31 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
           <span
             style={{
               ...styles.fpsDisplay,
-              color: fps > 30 ? "#10b981" : fps > 15 ? "#f59e0b" : "#ef4444"
+              color: displayFps > 30 ? "#10b981" : displayFps > 15 ? "#f59e0b" : "#ef4444"
             }}
           >
-            {fps} FPS
+            {displayFps} {displayFpsLabel} FPS
           </span>
+          <span style={workerBadgeStyle} title={workerError ?? ""}>
+            {workerLabel}
+          </span>
+          <span style={openCvBadgeStyle} title={openCvTooltip}>{openCvLabel}</span>
+          {trackingIntervalMsg && (
+            <span
+              style={{
+                fontSize: "0.7rem",
+                color: mainThreadSkipIntervalRef.current === 1 ? "#10b981" : "#f59e0b",
+                padding: "4px 8px",
+                background: mainThreadSkipIntervalRef.current === 1 
+                  ? "rgba(16, 185, 129, 0.15)" 
+                  : "rgba(245, 158, 11, 0.15)",
+                borderRadius: "4px"
+              }}
+              title="Tracking runs at controlled intervals to keep video smooth"
+            >
+              Track: {trackingIntervalMsg}
+            </span>
+          )}
           {openaiKey && (
             <span
               style={{
@@ -3363,6 +5047,46 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
             <button style={styles.ctrlBtn} onClick={cycleStyle}>
               ◐ {annotationStyle}
             </button>
+            <button
+              style={{
+                ...styles.ctrlBtn,
+                ...(effectiveQuality === "precision" ? styles.ctrlBtnActive : {}),
+                opacity: workerStatus === "starting" ? 0.6 : 1,
+                cursor: workerStatus === "starting" ? "wait" : "pointer"
+              }}
+              onClick={() => {
+                if (!workerEnabled) {
+                  initWorker();
+                  return;
+                }
+                setTrackingQuality((prev) => (prev === "precision" ? "balanced" : "precision"));
+              }}
+              disabled={workerStatus === "starting"}
+              title={
+                workerEnabled
+                  ? "Toggle tracking quality (precision is heavier but more accurate)"
+                  : "Worker is off: click to restart worker"
+              }
+            >
+              {qualityLabel}
+            </button>
+            <button
+              style={{
+                ...styles.ctrlBtn,
+                ...(preferMainThread ? styles.ctrlBtnActive : {}),
+                display: "flex",
+                alignItems: "center",
+                gap: "6px"
+              }}
+              onClick={() => setPreferMainThread((prev) => !prev)}
+              title={
+                preferMainThread
+                  ? "Using main thread (JS-only tracking). Click to use worker + OpenCV"
+                  : "Using worker + OpenCV. Click to use main thread (JS-only tracking)"
+              }
+            >
+              {preferMainThread ? "🧵 Main Thread" : "⚙️ Worker"}
+            </button>
             <div
               style={{
                 width: "1px",
@@ -3437,6 +5161,12 @@ export function MedSyncVision({ openaiApiKey, detectionServerUrl }: MedSyncVisio
             </button>
             {/* Anchor visualization removed - anchors work internally but are not shown to user */}
           </div>
+          {workerStatus === "error" && workerError && (
+            <div style={styles.statusWarning}>Worker error: {workerError}</div>
+          )}
+          {openCvReady === false && openCvError && (
+            <div style={styles.statusWarning}>OpenCV error: {openCvError}</div>
+          )}
 
           {/* Server Detection Status Bar */}
           {useServerDetection && (

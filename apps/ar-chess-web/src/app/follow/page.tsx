@@ -2,6 +2,8 @@ import { HoloRayFollow } from "@hypervision/modules";
 import Link from "next/link";
 
 export default function FollowPage() {
+  const openaiApiKey = process.env.NEXT_PUBLIC_OPENAI_API_KEY;
+  
   return (
     <main>
       <section className="page-hero">
@@ -9,12 +11,12 @@ export default function FollowPage() {
           <span className="eyebrow">Tracking Lab</span>
           <h1 className="page-title">HoloRay Follow</h1>
           <p className="page-lede">
-            Click any object in the camera feed and keep it locked with real-time tracking. This is
-            the core HoloRay demo used across domains for rapid, precise target following.
+            Real-time object tracking with AI identification. Click any object and the camera 
+            will track it with advanced optical flow, Kalman smoothing, and AI-powered re-acquisition.
           </p>
           <div className="hero-actions">
-            <span className="status-pill status-live">Live</span>
-            <span className="status-pill status-planning">Click-to-follow</span>
+            <span className="status-pill status-live">Live Camera</span>
+            <span className="status-pill status-planning">AI-Powered</span>
           </div>
         </div>
         <div className="page-actions">
@@ -25,31 +27,33 @@ export default function FollowPage() {
       </section>
 
       <section className="card">
-        <HoloRayFollow />
+        <HoloRayFollow openaiApiKey={openaiApiKey} />
       </section>
 
       <section className="grid detail-grid">
         <div className="card">
-          <h2 className="card-title">Follow features</h2>
+          <h2 className="card-title">Tracking features</h2>
           <ul className="list text-sm text-gray-700">
-            <li>Click-to-lock target tracking</li>
-            <li>Adaptive template matching with recovery</li>
-            <li>Precision, balanced, and performance profiles</li>
+            <li>Multi-point optical flow tracking</li>
+            <li>Kalman filter smoothing</li>
+            <li>Forward-backward validation</li>
+            <li>AI-powered object identification</li>
           </ul>
         </div>
         <div className="card">
-          <h2 className="card-title">Demo behavior</h2>
+          <h2 className="card-title">AI capabilities</h2>
           <ul className="list text-sm text-gray-700">
-            <li>Single-target follow workflow</li>
-            <li>Motion and quality indicators</li>
-            <li>Path trail for visual debugging</li>
+            <li>Automatic object identification on click</li>
+            <li>Periodic validation of tracked object</li>
+            <li>Smart re-acquisition when lost</li>
+            <li>Drawing annotation support</li>
           </ul>
         </div>
         <div className="card">
           <h2 className="card-title">How to use</h2>
           <p className="text-sm text-gray-700">
-            Start the session, click a subject, and move your camera. The tracker stays locked until
-            the target is lost or you click a new object.
+            Start the camera, click objects to track them. Toggle Draw mode to annotate areas.
+            The AI will identify objects and help re-acquire them when lost.
           </p>
         </div>
       </section>

@@ -198,35 +198,6 @@ export default function HomePage() {
           </Link>
         </div>
       </section>
-
-      <section className="tech-showcase">
-        <div className="section-header">
-          <h2 className="section-title">Powered by HoloRay</h2>
-          <p className="section-lede">
-            Our tracking engine delivers medical-grade precision across all domains.
-          </p>
-        </div>
-        <div className="grid mission-grid">
-          <div className="card mission-card reveal" style={{ animationDelay: "0.05s" }}>
-            <h3 className="card-title">🎯 Adaptive tracking</h3>
-            <p className="text-sm text-gray-700">
-              Predictive search and smoothing keep targets locked even during rapid motion.
-            </p>
-          </div>
-          <div className="card mission-card reveal" style={{ animationDelay: "0.1s" }}>
-            <h3 className="card-title">🧪 Confidence scoring</h3>
-            <p className="text-sm text-gray-700">
-              Real-time confidence indicators help operators trust and verify tracking stability.
-            </p>
-          </div>
-          <div className="card mission-card reveal" style={{ animationDelay: "0.15s" }}>
-            <h3 className="card-title">🔄 Recovery windows</h3>
-            <p className="text-sm text-gray-700">
-              Automatic recovery widens the search zone to reacquire targets after occlusion.
-            </p>
-          </div>
-        </div>
-      </section>
     </main>
   );
 }

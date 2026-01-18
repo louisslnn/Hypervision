@@ -64,6 +64,9 @@ export interface DetectionClientConfig {
   onError?: (error: Error) => void;
   autoReconnect?: boolean;
   reconnectInterval?: number;
+  maxInFlight?: number;
+  maxPendingMs?: number;
+  maxResultAgeMs?: number;
 }
 
 export interface ServerStats {
@@ -87,7 +90,8 @@ interface TrackedDetection extends Detection {
 class DetectionTracker {
   private tracked: Map<string, TrackedDetection> = new Map();
   private nextTrackId = 1;
-  private readonly maxAge = 1000; // ms before removing stale tracks
+  private readonly maxAge = 3000; // ms before removing stale tracks
+  private readonly maxPredictionMs = 1500;
   private readonly iouThreshold = 0.3;
   private readonly velocitySmoothingFactor = 0.4;
 
@@ -180,10 +184,9 @@ class DetectionTracker {
     const result: TrackedDetection[] = [];
 
     for (const [, track] of this.tracked) {
-      const dt = (now - track.lastUpdate) / 1000;
-
-      // Don't interpolate too far into the future
-      if (dt > 0.5) continue;
+      const dtMs = now - track.lastUpdate;
+      if (dtMs > this.maxAge) continue;
+      const dt = Math.max(0, Math.min(dtMs, this.maxPredictionMs)) / 1000;
 
       // Predict position based on velocity
       const predictedCenterX = track.interpolatedBox.centerX + track.velocity.x * dt;
@@ -261,6 +264,8 @@ export class DetectionClient {
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private frameCount = 0;
   private lastFrameTime = 0;
+  private inflight = 0;
+  private lastSendAt = 0;
   private tracker: DetectionTracker;
   private latestDetections: Detection[] = [];
 
@@ -279,7 +284,10 @@ export class DetectionClient {
       onDisconnect: config.onDisconnect ?? (() => {}),
       onError: config.onError ?? (() => {}),
       autoReconnect: config.autoReconnect ?? true,
-      reconnectInterval: config.reconnectInterval ?? 3000
+      reconnectInterval: config.reconnectInterval ?? 3000,
+      maxInFlight: config.maxInFlight ?? 1,
+      maxPendingMs: config.maxPendingMs ?? 1500,
+      maxResultAgeMs: config.maxResultAgeMs ?? 2000
     };
 
     this.tracker = new DetectionTracker();
@@ -354,62 +362,96 @@ export class DetectionClient {
 
     this.isConnected = false;
     this.tracker.clear();
+    this.inflight = 0;
+    this.lastSendAt = 0;
   }
 
   /**
    * Send a video frame for detection
    */
-  sendFrame(canvas: HTMLCanvasElement): void {
-    if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const now = Date.now();
-    const minInterval = 1000 / this.config.targetFps;
-
-    if (now - this.lastFrameTime < minInterval) {
-      return;
-    }
-
-    this.lastFrameTime = now;
-    this.frameCount++;
-
-    try {
-      // Convert canvas to base64
-      const imageData = canvas.toDataURL("image/jpeg", 0.8);
-
-      this.ws.send(
-        JSON.stringify({
-          type: "frame",
-          data: imageData,
-          mode: this.config.mode,
-          timestamp: now
-        })
-      );
-    } catch (e) {
-      console.error("[DetectionClient] Failed to send frame:", e);
-    }
+sendFrame(canvas: HTMLCanvasElement): void {
+  if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    return;
   }
 
-  /**
-   * Send raw image data
-   */
-  sendImageData(imageData: string, timestamp?: number): void {
-    if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+  const now = Date.now();
+  const minInterval = 1000 / this.config.targetFps;
+
+  if (now - this.lastFrameTime < minInterval) {
+    return;
+  }
+
+  if (this.inflight >= this.config.maxInFlight) {
+    if (now - this.lastSendAt < this.config.maxPendingMs) {
       return;
     }
+    this.inflight = 0;
+  }
 
-    const now = timestamp ?? Date.now();
+  this.lastFrameTime = now;
+  this.lastSendAt = now;
+  this.frameCount += 1;
+  const frameId = `frame_${this.frameCount}`;
+  this.inflight += 1;
+
+  try {
+    // Convert canvas to base64
+    const imageData = canvas.toDataURL("image/jpeg", 0.8);
 
     this.ws.send(
       JSON.stringify({
         type: "frame",
         data: imageData,
         mode: this.config.mode,
-        timestamp: now
+        timestamp: now,
+        frame_id: frameId
       })
     );
+  } catch (e) {
+    this.inflight = Math.max(0, this.inflight - 1);
+    console.error("[DetectionClient] Failed to send frame:", e);
   }
+}
+
+
+  /**
+   * Send raw image data
+   */
+sendImageData(imageData: string, timestamp?: number): void {
+  if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const now = timestamp ?? Date.now();
+
+  if (this.inflight >= this.config.maxInFlight) {
+    if (now - this.lastSendAt < this.config.maxPendingMs) {
+      return;
+    }
+    this.inflight = 0;
+  }
+
+  this.lastSendAt = now;
+  this.frameCount += 1;
+  const frameId = `frame_${this.frameCount}`;
+  this.inflight += 1;
+
+  try {
+    this.ws.send(
+      JSON.stringify({
+        type: "frame",
+        data: imageData,
+        mode: this.config.mode,
+        timestamp: now,
+        frame_id: frameId
+      })
+    );
+  } catch (e) {
+    this.inflight = Math.max(0, this.inflight - 1);
+    console.error("[DetectionClient] Failed to send frame:", e);
+  }
+}
+
 
   /**
    * Get interpolated detections (between server updates)
@@ -502,6 +544,9 @@ export class DetectionClient {
 
     switch (type) {
       case "detections": {
+        if (this.inflight > 0) {
+          this.inflight -= 1;
+        }
         const result: DetectionResult = {
           type: "detections",
           detections: (data.detections as Detection[]) || [],
@@ -515,8 +560,10 @@ export class DetectionClient {
           }
         };
 
+        const receivedAt = Date.now();
+
         // Track round-trip time
-        const roundTrip = Date.now() - result.timestamp;
+        const roundTrip = receivedAt - result.timestamp;
         this.roundTripTimes.push(roundTrip);
         if (this.roundTripTimes.length > 30) {
           this.roundTripTimes.shift();
@@ -528,9 +575,16 @@ export class DetectionClient {
           this.serverInferenceTimes.shift();
         }
 
+        const resultAge = result.timestamp
+          ? Math.max(0, receivedAt - result.timestamp)
+          : 0;
+        if (resultAge > this.config.maxResultAgeMs) {
+          break;
+        }
+
         // Update tracker with new detections
         this.latestDetections = result.detections;
-        this.tracker.update(result.detections, result.serverTimestamp);
+        this.tracker.update(result.detections, receivedAt);
 
         // Notify callback
         this.config.onDetections(result);
@@ -554,6 +608,9 @@ export class DetectionClient {
 
       case "skipped": {
         // Frame was skipped due to rate limiting
+        if (this.inflight > 0) {
+          this.inflight -= 1;
+        }
         break;
       }
 

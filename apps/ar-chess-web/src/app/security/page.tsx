@@ -4,6 +4,7 @@ import Link from "next/link";
 export default function SecurityPage() {
   // Get OpenAI API key from environment variable (server-side)
   const openaiApiKey = process.env.NEXT_PUBLIC_OPENAI_API_KEY;
+  const signalServerUrl = process.env.NEXT_PUBLIC_SECUREWATCH_SIGNAL_URL;
 
   return (
     <main>
@@ -28,7 +29,7 @@ export default function SecurityPage() {
       </section>
 
       <section className="card">
-        <SecureWatch openaiApiKey={openaiApiKey} />
+        <SecureWatch openaiApiKey={openaiApiKey} signalServerUrl={signalServerUrl} />
       </section>
 
       <section className="grid detail-grid">
@@ -54,8 +55,9 @@ export default function SecurityPage() {
         <div className="card">
           <h2 className="card-title">How to use</h2>
           <p className="text-sm text-gray-700">
-            Allow camera access, start monitoring, then click on subjects to track. Adjust the
-            tracking profile as needed for precision versus performance.
+            Choose a video source (camera, demo clip, upload, or WebRTC). Start monitoring, then
+            click on subjects to track. Adjust the tracking profile as needed for precision versus
+            performance.
           </p>
         </div>
       </section>
